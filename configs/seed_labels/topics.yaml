@@ -1,0 +1,120 @@
+labels:
+- id: L001
+  label: Adult Content
+  definition: >
+    Content that is sexually explicit, pornographic, or otherwise intended for adults only. This includes nudity, sexual acts, and adult entertainment.
+
+- id: L002
+  label: Art & Design
+  definition: >
+    Content related to art, design, and creative expression. This includes visual arts, graphic design, architecture, and other forms of creative work.
+
+- id: L003
+  label: Software Development
+  definition: >
+    Content related to the development of software. This includes programming, algorithms, and web development.
+
+- id: L004
+  label: Crime & Law
+  definition: >
+    Content related to crime and the legal system. This includes law enforcement, criminal justice, and legal proceedings.
+
+- id: L005
+  label: Education & Jobs
+  definition: >
+    Content related to education and employment. This includes pedagogy, training & certification, and academia.
+
+- id: L006
+  label: Electronics & Hardware
+  definition: >
+    Content related to electronics and hardware. This includes computer hardware, phones, televisions, and other consumer electronics.
+
+- id: L007
+  label: Entertainment
+  definition: >
+    Content related to entertainment. This includes music, movies, TV shows, videos, celebrities, humor, and nightlife.
+
+- id: L008
+  label: Social Life
+  definition: >
+    Content related to different aspects of social life. This includes family, friends, relationships, and community.
+
+- id: L009
+  label: Fashion & Beauty
+  definition: >
+    Content related to fashion and beauty. This includes clothing, accessories, and cosmetics.
+
+- id: L010
+  label: Finance & Business
+  definition: >
+    Content related to finance and business. This includes taxes, regulations, investments, insurance, credit cards, personal finance, corporate communication, marketing, and human resources.
+
+- id: L011
+  label: Food & Dining
+  definition: >
+    Content related to food and dining. This includes recipes, groceries, beverages, and restaurants.
+
+- id: L012
+  label: Games
+  definition: >
+    Content related to games and gaming. This includes video games, board games, and gambling.
+
+- id: L013
+  label: Health
+  definition: >
+    Content related to health and wellness. This includes medicine, wellness, mental health, veterinary science, and nutritional science.
+
+- id: L014
+  label: History & Geography
+  definition: >
+    Content related to history and geography. This includes historical events, geographical features, and cultural heritage.
+
+- id: L015
+  label: Home & Hobbies
+  definition: >
+    Content related to home and hobbies. This includes real estate, renting, relocation, furniture, appliances, home improvement, DIY, gardening, pets, toys, and collecting.
+
+- id: L016
+  label: Industrial
+  definition: >
+    Content related to mining, agriculture, manufacturing, utilities, and construction. This includes raw materials, industrial goods, chemicals, and textiles.
+
+- id: L017
+  label: Literature
+  definition: >
+    Content related to literature. This includes literary criticism, linguistics, philosophy, and related subjects in the humanities.
+
+- id: L018
+  label: Politics
+  definition: >
+    Content related to social issues, political campaigns, the legislative process, geopolitics, protests, activism.
+
+- id: L019
+  label: Religion
+  definition: >
+    Content related to religion. This includes spirituality, faith, and religious practices.
+
+- id: L020
+  label: Science, Math & Technology
+  definition: >
+    Content related to science, mathematics, and technology. This includes physics, chemistry, biology, environmental science, mathematics, statistics, biotech, and engineering.
+
+- id: L021
+  label: Software
+  definition: >
+    Content related to the use of software and the internet.
+
+- id: L022
+  label: Sports & Fitness
+  definition: >
+    Content related to sports and fitness. This includes martial arts, motor sports, outdoor activities, and sports equipment.
+
+- id: L023
+  label: Transportation
+  definition: >
+    Content related to transportation. This includes cars and other vehicles, taxis, public transportation, traffic, commuting, aviation, rail, shipping, and logistics.
+
+- id: L024
+  label: Travel & Tourism
+  definition: >
+    Content related to travel and tourism. This includes hospitality, hotels, sight-seeing, and cruises.
