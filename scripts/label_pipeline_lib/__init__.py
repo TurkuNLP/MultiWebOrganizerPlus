@@ -1,61 +1,69 @@
-from __future__ import annotations
-
-from label_pipeline_lib import (
+from label_pipeline_lib.classification import (
+    build_classification_metadata,
+    ensure_classification_metadata,
+    metadata_path_for_output,
+    run_classification,
+)
+from label_pipeline_lib.cli import build_arg_parser, main, validate_cli_args
+from label_pipeline_lib.common import (
     LOGGER,
     M,
-    ModelClient,
     T,
     active_labels,
     append_models_jsonl,
-    apply_reconciliation,
     atomic_write_model,
     atomic_write_text,
     batch_iter,
-    build_arg_parser,
-    build_classification_metadata,
-    build_discovery_messages,
-    build_discovery_settings,
-    build_frozen_classification_messages,
-    build_reconciliation_messages,
-    build_discovery_output_schema,
-    build_classification_output_schema,
-    build_reconciliation_output_schema,
     canonical_json,
-    combine_proposal_groups,
     configure_logging,
-    ensure_classification_metadata,
     ensure_parent,
     file_fingerprint,
-    initialize_or_load_taxonomy,
     iter_jsonl_models,
-    labels_for_prompt,
     load_model_file,
-    load_result_index,
     load_seed_labels,
-    main,
-    metadata_path_for_output,
     next_dynamic_id,
     normalize_text,
+    resolve_alias,
+    seed_labels_hash,
+    stream_documents,
+    taxonomy_hash,
+    validate_taxonomy_state,
+    validate_unique_labels,
+)
+from label_pipeline_lib.discovery import (
+    apply_reconciliation,
+    build_discovery_settings,
+    combine_proposal_groups,
+    initialize_or_load_taxonomy,
+    load_result_index,
     proposal_group_id,
     proposal_id,
     reconcile_pending,
     reset_discovery_files,
-    resolve_alias,
-    run_classification,
     run_discovery,
     scan_discovery_results,
-    seed_labels_hash,
-    stream_documents,
-    StructuredSchemaSpec,
-    taxonomy_hash,
     update_usage_counts,
-    validate_cli_args,
     validate_reconciliation_semantics,
-    validate_taxonomy_state,
-    validate_unique_labels,
+)
+from label_pipeline_lib.model import ModelClient
+from label_pipeline_lib.prompts import (
+    build_discovery_messages,
+    build_frozen_classification_messages,
+    build_reconciliation_messages,
+    labels_for_prompt,
+)
+from label_pipeline_lib.structured_schemas import (
+    StructuredSchemaSpec,
+    build_discovery_output_schema,
+    build_classification_output_schema,
+    build_reconciliation_output_schema,
 )
 
 __all__ = [
+    "StructuredSchemaSpec",
+    "build_discovery_output_schema",
+    "build_classification_output_schema",
+    "build_reconciliation_output_schema",
     "LOGGER",
     "M",
     "ModelClient",
@@ -73,8 +81,8 @@ __all__ = [
     "build_frozen_classification_messages",
     "build_reconciliation_messages",
     "canonical_json",
-    "combine_proposal_groups",
     "configure_logging",
+    "combine_proposal_groups",
     "ensure_classification_metadata",
     "ensure_parent",
     "file_fingerprint",
@@ -105,7 +113,3 @@ __all__ = [
     "validate_taxonomy_state",
     "validate_unique_labels",
 ]
-
-
-if __name__ == "__main__":
-    main()
