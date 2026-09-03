@@ -29,6 +29,7 @@ from label_pipeline_lib.common import (
     validate_unique_labels,
 )
 from label_pipeline_lib.model import ModelClient
+from label_pipeline_lib.compute_logger import start_compute_logger, detect_num_gpus
 from schemas import (
     DiscoveryRecord,
     DiscoverySettings,
@@ -712,89 +713,107 @@ def run_discovery(args: argparse.Namespace) -> None:
     processed_this_run = 0
     total_input = 0
 
-    def pending_docs() -> Iterator[InputDocument]:
-        nonlocal total_input
-        for doc in stream_documents(input_path):
-            total_input += 1
-            if doc.doc_id in seen_input_ids:
-                raise ValueError(f"Duplicate doc_id {doc.doc_id!r} in input corpus")
-            seen_input_ids.add(doc.doc_id)
-            if doc.doc_id in completed_ids:
-                continue
-            yield doc
+    # Optionally start compute logger
+    stop_event = None
+    if getattr(args, "compute_logging", False):
+        def _get_progress() -> tuple[int, int]:
+            return processed_this_run, total_input
 
-    for batch in batch_iter(pending_docs(), args.batch_size):
-        labels_snapshot = active_labels(state)
-        outputs = model.discover_batch(
-            batch,
-            labels_snapshot,
-            aspect=state.aspect,
-            max_document_tokens=args.max_document_tokens,
-            output_max_tokens=args.classification_max_tokens,
-            max_assigned_labels_per_doc=args.max_assigned_labels_per_doc,
-            max_proposals_per_doc=args.max_proposals_per_doc,
-        )
-        if len(outputs) != len(batch):
-            raise RuntimeError(
-                f"Expected {len(batch)} validated outputs, got {len(outputs)}"
-            )
-
-        records: list[DiscoveryRecord] = []
-        for doc, output in zip(batch, outputs, strict=True):
-            proposals = [
-                ProposedLabelRecord(
-                    proposal_id=proposal_id(
-                        doc.doc_id,
-                        index,
-                        proposed.name,
-                        proposed.definition,
-                    ),
-                    name=proposed.name,
-                    definition=proposed.definition,
-                )
-                for index, proposed in enumerate(output.proposed_labels)
-            ]
-            records.append(
-                DiscoveryRecord(
-                    seq=next_seq,
-                    doc_id=doc.doc_id,
-                    taxonomy_version=state.schema_version,
-                    assigned_label_ids=output.assigned_label_ids,
-                    proposed_labels=proposals,
-                )
-            )
-            next_seq += 1
-
-        append_models_jsonl(discovery_output, records)
-        for record in records:
-            completed_ids.add(record.doc_id)
-        processed_this_run += len(records)
-        last_seq = records[-1].seq
-
-        LOGGER.info(
-            "Discovery: persisted %d documents this run; latest seq=%d; taxonomy v%d",
-            processed_this_run,
-            last_seq,
-            state.schema_version,
+        stop_event = start_compute_logger(
+            interval=getattr(args, "compute_logging_interval", 300.0),
+            num_gpus=detect_num_gpus(getattr(args, "tensor_parallel_size", 1)),
+            get_progress=_get_progress,
         )
 
-        if last_seq - state.last_reconciled_discovery_seq >= args.reconcile_every:
-            state = reconcile_pending(
-                model=model,
-                state=state,
-                discovery_output=discovery_output,
-                taxonomy_path=taxonomy_path,
-                max_total_labels=args.max_total_labels,
-                min_create_support=args.min_create_support,
-                max_reconcile_groups=args.max_reconcile_groups,
-                reconcile_max_tokens=args.reconcile_max_tokens,
-                final_maintenance=False,
+    try:
+
+        def pending_docs() -> Iterator[InputDocument]:
+            nonlocal total_input
+            for doc in stream_documents(input_path):
+                total_input += 1
+                if doc.doc_id in seen_input_ids:
+                    raise ValueError(f"Duplicate doc_id {doc.doc_id!r} in input corpus")
+                seen_input_ids.add(doc.doc_id)
+                if doc.doc_id in completed_ids:
+                    continue
+                yield doc
+
+        for batch in batch_iter(pending_docs(), args.batch_size):
+            labels_snapshot = active_labels(state)
+            outputs = model.discover_batch(
+                batch,
+                labels_snapshot,
+                aspect=state.aspect,
+                max_document_tokens=args.max_document_tokens,
+                output_max_tokens=args.classification_max_tokens,
+                max_assigned_labels_per_doc=args.max_assigned_labels_per_doc,
+                max_proposals_per_doc=args.max_proposals_per_doc,
             )
-            LOGGER.info(
-                "Reconciled taxonomy: version=%d active_labels=%d",
-                state.schema_version,
-                len(active_labels(state)),
-            )
+            if len(outputs) != len(batch):
+                raise RuntimeError(
+                    f"Expected {len(batch)} validated outputs, got {len(outputs)}"
+                )
+
+            records: list[DiscoveryRecord] = []
+            for doc, output in zip(batch, outputs, strict=True):
+                proposals = [
+                    ProposedLabelRecord(
+                        proposal_id=proposal_id(
+                            doc.doc_id,
+                            index,
+                            proposed.name,
+                            proposed.definition,
+                        ),
+                        name=proposed.name,
+                        definition=proposed.definition,
+                    )
+                    for index, proposed in enumerate(output.proposed_labels)
+                ]
+                records.append(
+                    DiscoveryRecord(
+                        seq=next_seq,
+                        doc_id=doc.doc_id,
+                        taxonomy_version=state.schema_version,
+                        assigned_label_ids=output.assigned_label_ids,
+                        proposed_labels=proposals,
+                    )
+                )
+                next_seq += 1
+
+            append_models_jsonl(discovery_output, records)
+            for record in records:
+                completed_ids.add(record.doc_id)
+                processed_this_run += len(records)
+                last_seq = records[-1].seq
+
+                LOGGER.info(
+                    "Discovery: persisted %d documents this run; latest seq=%d; taxonomy v%d",
+                    processed_this_run,
+                    last_seq,
+                    state.schema_version,
+                )
+
+                if last_seq - state.last_reconciled_discovery_seq >= args.reconcile_every:
+                    state = reconcile_pending(
+                        model=model,
+                        state=state,
+                        discovery_output=discovery_output,
+                        taxonomy_path=taxonomy_path,
+                        max_total_labels=args.max_total_labels,
+                        min_create_support=args.min_create_support,
+                        max_reconcile_groups=args.max_reconcile_groups,
+                        reconcile_max_tokens=args.reconcile_max_tokens,
+                        final_maintenance=False,
+                    )
+                    LOGGER.info(
+                        "Reconciled taxonomy: version=%d active_labels=%d",
+                        state.schema_version,
+                        len(active_labels(state)),
+                    )
+
+    finally:
+        if stop_event is not None:
+            stop_event.set()
 
     if total_input == 0:
         raise ValueError("Input corpus contains no documents")
