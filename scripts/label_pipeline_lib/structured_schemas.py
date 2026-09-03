@@ -16,6 +16,11 @@ SchemaT = TypeVar(
 
 
 @dataclass(frozen=True)
+class PromptItem:
+    debug_id: str
+    messages: list[dict[str, str]]
+
+@dataclass(frozen=True)
 class StructuredSchemaSpec(Generic[SchemaT]):
     model_type: type[SchemaT]
     json_schema: dict
