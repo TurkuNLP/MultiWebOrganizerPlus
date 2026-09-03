@@ -5,7 +5,7 @@ mode: "discover"  # choice: discover, classify
 
 model:
   name: "Qwen/Qwen3.8-27B"
-  batch_size: 128
+  batch_size: 512
   max_model_len: 32768
   max_document_tokens: 8192
   classification_max_tokens: 4096
@@ -42,6 +42,6 @@ reconcile:
   expected_seed_label_count: 24
 
 runtime:
-  log_level: "INFO"
-  reset_discovery: false
-  overwrite_output: false
+  log_level: "INFO"  # one of: DEBUG, INFO, WARNING, ERROR
+  reset_discovery: false # whether to reset discovery state (if true, will ignore existing discovery output)
+  overwrite_output: false # whether to overwrite existing classification output file (if true, will overwrite)
