@@ -21,6 +21,7 @@ from label_pipeline_lib.common import (
     validate_taxonomy_state,
 )
 from label_pipeline_lib.model import ModelClient
+from label_pipeline_lib.compute_logger import start_compute_logger, detect_num_gpus
 from schemas import (
     ClassificationRunMetadata,
     FinalClassificationRecord,
@@ -151,51 +152,69 @@ def run_classification(args: argparse.Namespace) -> None:
     processed_this_run = 0
     total_input = 0
 
-    def pending_docs() -> Iterator[InputDocument]:
-        nonlocal total_input
-        for doc in stream_documents(input_path):
-            total_input += 1
-            if doc.doc_id in seen_input_ids:
-                raise ValueError(f"Duplicate doc_id {doc.doc_id!r} in input corpus")
-            seen_input_ids.add(doc.doc_id)
-            if doc.doc_id in completed_ids:
-                continue
-            yield doc
+    # Optionally start compute logger
+    stop_event = None
+    if getattr(args, "compute_logging", False):
+        def _get_progress() -> tuple[int, int]:
+            return processed_this_run, total_input
 
-    for batch in batch_iter(pending_docs(), args.batch_size):
-        outputs = model.classify_batch(
-            batch,
-            labels_snapshot,
-            aspect=state.aspect,
-            max_document_tokens=args.max_document_tokens,
-            output_max_tokens=args.classification_max_tokens,
-            max_assigned_labels_per_doc=args.max_assigned_labels_per_doc,
+        stop_event = start_compute_logger(
+            interval=getattr(args, "compute_logging_interval", 300.0),
+            num_gpus=detect_num_gpus(getattr(args, "tensor_parallel_size", 1)),
+            get_progress=_get_progress,
         )
-        if len(outputs) != len(batch):
-            raise RuntimeError(
-                f"Expected {len(batch)} validated outputs, got {len(outputs)}"
+
+    try:
+        def pending_docs() -> Iterator[InputDocument]:
+            nonlocal total_input
+            for doc in stream_documents(input_path):
+                total_input += 1
+                if doc.doc_id in seen_input_ids:
+                    raise ValueError(f"Duplicate doc_id {doc.doc_id!r} in input corpus")
+                seen_input_ids.add(doc.doc_id)
+                if doc.doc_id in completed_ids:
+                    continue
+                yield doc
+
+        for batch in batch_iter(pending_docs(), args.batch_size):
+            outputs = model.classify_batch(
+                batch,
+                labels_snapshot,
+                aspect=state.aspect,
+                max_document_tokens=args.max_document_tokens,
+                output_max_tokens=args.classification_max_tokens,
+                max_assigned_labels_per_doc=args.max_assigned_labels_per_doc,
+            )
+            if len(outputs) != len(batch):
+                raise RuntimeError(
+                    f"Expected {len(batch)} validated outputs, got {len(outputs)}"
+                )
+
+            records = [
+                FinalClassificationRecord(
+                    seq=next_seq + index,
+                    doc_id=doc.doc_id,
+                    taxonomy_version=state.schema_version,
+                    taxonomy_hash=state.frozen_taxonomy_hash or taxonomy_hash(state),
+                    assigned_label_ids=output.assigned_label_ids,
+                )
+                for index, (doc, output) in enumerate(zip(batch, outputs, strict=True))
+            ]
+            append_models_jsonl(output_path, records)
+            for record in records:
+                completed_ids.add(record.doc_id)
+            next_seq += len(records)
+            processed_this_run += len(records)
+            LOGGER.info(
+                "Classification: persisted %d documents this run; latest seq=%d",
+                processed_this_run,
+                next_seq - 1,
             )
 
-        records = [
-            FinalClassificationRecord(
-                seq=next_seq + index,
-                doc_id=doc.doc_id,
-                taxonomy_version=state.schema_version,
-                taxonomy_hash=state.frozen_taxonomy_hash or taxonomy_hash(state),
-                assigned_label_ids=output.assigned_label_ids,
-            )
-            for index, (doc, output) in enumerate(zip(batch, outputs, strict=True))
-        ]
-        append_models_jsonl(output_path, records)
-        for record in records:
-            completed_ids.add(record.doc_id)
-        next_seq += len(records)
-        processed_this_run += len(records)
-        LOGGER.info(
-            "Classification: persisted %d documents this run; latest seq=%d",
-            processed_this_run,
-            next_seq - 1,
-        )
+    finally:
+        if stop_event is not None:
+            # Signal the compute logger to stop; it will also mark the event when exiting
+            stop_event.set()
 
     if total_input == 0:
         raise ValueError("Input corpus contains no documents")

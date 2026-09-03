@@ -49,6 +49,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--aspect", default="topics")
     parser.add_argument(
+        "--compute-logging",
+        action="store_true",
+        help="Enable periodic compute logging (elapsed time and GPU-hours estimates)",
+    )
+    parser.add_argument(
+        "--compute-logging-interval",
+        type=float,
+        default=300.0,
+        help="Seconds between compute-logging messages (default: 300)",
+    )
+    parser.add_argument(
         "--seed-labels",
         default="MultiWebOrganizerPlus/config/seed_labels/topics.yaml",
     )
