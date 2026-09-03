@@ -13,7 +13,6 @@ class StrictModel(BaseModel):
         str_strip_whitespace=True,
     )
 
-
 class LabelDef(StrictModel):
     id: str = Field(min_length=1)
     name: str = Field(min_length=1)
