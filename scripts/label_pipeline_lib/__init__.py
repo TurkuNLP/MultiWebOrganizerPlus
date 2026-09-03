@@ -54,6 +54,7 @@ from label_pipeline_lib.prompts import (
 )
 from label_pipeline_lib.structured_schemas import (
     StructuredSchemaSpec,
+    PromptItem,
     build_discovery_output_schema,
     build_classification_output_schema,
     build_reconciliation_output_schema,
@@ -61,6 +62,7 @@ from label_pipeline_lib.structured_schemas import (
 
 __all__ = [
     "StructuredSchemaSpec",
+    "PromptItem",
     "build_discovery_output_schema",
     "build_classification_output_schema",
     "build_reconciliation_output_schema",

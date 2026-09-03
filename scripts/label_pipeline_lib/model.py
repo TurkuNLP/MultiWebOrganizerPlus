@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Sequence, TypeVar
 
@@ -20,6 +21,7 @@ from label_pipeline_lib.prompts import (
 )
 from label_pipeline_lib.structured_schemas import (
     StructuredSchemaSpec,
+    PromptItem,
     build_discovery_output_schema,
     build_classification_output_schema,
     build_reconciliation_output_schema,
@@ -204,12 +206,12 @@ class ModelClient:
 
     def _run_structured_chat(
         self,
-        conversations: Sequence[list[dict[str, str]]],
+        prompt_items: Sequence[PromptItem],
         *,
         schema_spec: StructuredSchemaSpec,
         max_tokens: int,
     ) -> list[M]:
-        if not conversations:
+        if not prompt_items:
             return []
 
         sampling_params = self._sampling_params(
@@ -221,9 +223,10 @@ class ModelClient:
 
         generate_start_time = time.time()
 
+        messages = [prompt_item.messages for prompt_item in prompt_items]
         # Generate outputs using the LLM's chat method
         outputs = self.llm.chat(
-            messages=list(conversations),
+            messages=messages,
             sampling_params=sampling_params,
             use_tqdm=False,
             **kwargs,
@@ -238,22 +241,22 @@ class ModelClient:
             generated_tokens=generated_tokens,
             elapsed_seconds=generate_end_time - generate_start_time,
         )
-        if len(outputs) != len(conversations):
+        if len(outputs) != len(messages):
             raise RuntimeError(
-                f"vLLM returned {len(outputs)} outputs for {len(conversations)} prompts"
+                f"vLLM returned {len(outputs)} outputs for {len(messages)} prompts"
             )
 
         parsed: list[M] = []
         for index, request_output in enumerate(outputs):
             if len(request_output.outputs) != 1:
                 raise RuntimeError(
-                    f"Prompt {index}: expected exactly one completion, "
+                    f"{prompt_items[index].debug_id}: expected exactly one completion, "
                     f"got {len(request_output.outputs)}"
                 )
             completion = request_output.outputs[0]
             if completion.finish_reason != "stop":
                 raise RuntimeError(
-                    f"Prompt {index}: generation ended with finish_reason="
+                    f"{prompt_items[index].debug_id}: generation ended with finish_reason="
                     f"{completion.finish_reason!r}; output may be truncated.\n"
                     f"Configured max_tokens={sampling_params.max_tokens}\n"
                     f"Generated tokens: {len(completion.token_ids)}\n"
@@ -261,15 +264,34 @@ class ModelClient:
                 )
             generated_text = completion.text
             if not generated_text:
-                raise RuntimeError(f"Prompt {index}: model returned empty output")
-            try:
-                parsed.append(
-                    schema_spec.model_type.model_validate_json(generated_text)
+                raise RuntimeError(
+                    f"{prompt_items[index].debug_id}: model returned empty output"
                 )
+            try:
+                payload = json.loads(generated_text)
+
+                # Forcefully deduplicate assigned_label_ids to avoid validation errors due to duplicates
+                # This is a workaround for cases where the model may return duplicate label IDs, which would violate the schema's constraints.
+                # Would be better to enforce uniqueness in the output itself, but that is not easily doable.
+                if "assigned_label_ids" in payload and isinstance(
+                    payload["assigned_label_ids"], list
+                ):
+                    num_assigned_label_ids = len(payload["assigned_label_ids"])
+                    payload["assigned_label_ids"] = list(
+                        dict.fromkeys(payload["assigned_label_ids"])
+                    )
+                    num_deduplicated = len(payload["assigned_label_ids"])
+                    if num_deduplicated < num_assigned_label_ids:
+                        LOGGER.warning(
+                            f"{prompt_items[index].debug_id}: "
+                            f"model returned {num_assigned_label_ids - num_deduplicated} duplicate assigned_label_ids; "
+                            f"deduplicated to {num_deduplicated}."
+                        )
+                parsed.append(schema_spec.model_type.model_validate(payload))
             except ValidationError as exc:
                 preview = generated_text[:2000]
                 raise ValueError(
-                    f"Prompt {index}: model output failed {schema_spec.model_type.__name__} "
+                    f"{prompt_items[index].debug_id}: model output failed {schema_spec.model_type.__name__} "
                     f"validation: {exc}. Output preview: {preview!r}"
                 ) from exc
         return parsed
@@ -285,7 +307,10 @@ class ModelClient:
         max_assigned_labels_per_doc: int,
         max_proposals_per_doc: int,
     ) -> list[LabellingOutputSchema]:
-        conversations = [
+
+        prompt_items: list[PromptItem] = []
+
+        messages = [
             self.fit_document_messages(
                 text=doc.text,
                 labels=labels,
@@ -297,7 +322,16 @@ class ModelClient:
             for doc in docs
         ]
 
+        prompt_items.extend(
+            PromptItem(
+                debug_id=f"doc:{doc.doc_id}",
+                messages=messages,
+            )
+            for doc, messages in zip(docs, messages, strict=True)
+        )
+
         valid_label_ids = [label.id for label in labels]
+
         discovery_schema_spec = build_discovery_output_schema(
             valid_label_ids=valid_label_ids,
             max_assigned_labels=max_assigned_labels_per_doc,
@@ -305,7 +339,7 @@ class ModelClient:
         )
 
         results = self._run_structured_chat(
-            conversations,
+            prompt_items,
             schema_spec=discovery_schema_spec,
             max_tokens=output_max_tokens,
         )
@@ -334,7 +368,10 @@ class ModelClient:
         output_max_tokens: int,
         max_assigned_labels_per_doc: int,
     ) -> list[FrozenClassificationOutputSchema]:
-        conversations = [
+
+        prompt_items: list[PromptItem] = []
+
+        messages = [
             self.fit_document_messages(
                 text=doc.text,
                 labels=labels,
@@ -346,13 +383,21 @@ class ModelClient:
             for doc in docs
         ]
 
-        classification_schema_spec = self.build_classification_output_schema(
+        prompt_items.extend(
+            PromptItem(
+                debug_id=f"doc:{doc.doc_id}",
+                messages=messages,
+            )
+            for doc, messages in zip(docs, messages, strict=True)
+        )
+
+        classification_schema_spec = build_classification_output_schema(
             valid_label_ids=[label.id for label in labels],
             max_assigned_labels=max_assigned_labels_per_doc,
         )
 
         results = self._run_structured_chat(
-            conversations,
+            prompt_items,
             schema_spec=classification_schema_spec,
             max_tokens=output_max_tokens,
         )
@@ -392,12 +437,25 @@ class ModelClient:
             for group in proposal_groups
         ]
 
+        prompt_items: list[PromptItem] = []
+
         messages = build_reconciliation_messages(
             state,
             model_proposal_groups,
             max_total_labels=max_total_labels,
             min_create_support=min_create_support,
             final_maintenance=final_maintenance,
+        )
+
+        prompt_items.append(
+            PromptItem(
+                debug_id=(
+                    f"reconciliation:"
+                    f"{'final' if final_maintenance else 'periodic'}:"
+                    f"taxonomy_v{state.schema_version}"
+                ),
+                messages=messages,
+            )
         )
 
         prompt_tokens = self._chat_token_count(messages)
@@ -416,8 +474,8 @@ class ModelClient:
         )
 
         result = self._run_structured_chat(
-            [messages],
-            schema=schema_spec,
+            prompt_items,
+            schema_spec=schema_spec,
             max_tokens=max_tokens,
         )[0]
 
