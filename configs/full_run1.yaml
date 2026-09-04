@@ -1,0 +1,49 @@
+# Default configuration for the label pipeline
+# Adjust values to match your environment and model choices.
+
+mode: "discover"  # choice: discover, classify
+
+model:
+  name: "Qwen/Qwen3.8-27B"
+  batch_size: 512
+  max_model_len: 32768
+  max_document_tokens: 8192
+  classification_max_tokens: 4096
+  reconcile_max_tokens: 8192
+  tensor_parallel_size: 4
+  gpu_memory_utilization: 0.90
+  dtype: "auto"
+  seed: 0
+  thinking_mode: "disabled"  # one of: disabled, enabled, template-default
+
+paths:
+  # Input corpus (JSONL, lines with {"doc_id":..., "text":...})
+  input: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/data/FineWebSample.jsonl"
+  # Seed labels YAML file (keep relative to repo or absolute)
+  seed_labels: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/configs/seed_labels/topics.yaml"
+  # Taxonomy state file (read/write)
+  taxonomy: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/results/full_run1/taxonomy_state.json"
+  # Discovery-mode intermediate output (JSONL)
+  discovery_output: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/results/full_run1/discovery.jsonl"
+  # Final classification output (JSONL)
+  output: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/results/full_run1/final_labels.jsonl"
+  # Directory where results/ artifacts will be stored
+  results_dir: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/results/full_run1"
+
+discovery:
+  max_proposals_per_doc: 3
+  max_assigned_labels_per_doc: 5
+
+reconcile:
+  reconcile_every: 2048
+  max_reconcile_groups: 128
+  min_create_support: 2
+  max_total_labels: 100
+  expected_seed_label_count: 24
+
+runtime:
+  log_level: "WARNING"  # one of: DEBUG, INFO, WARNING, ERROR
+  compute_logging: true # whether to log elapsed time and GPU-hours estimates
+  compute_logging_interval: 300 # seconds between compute-logging messages, if compute_logging is true
+  reset_discovery: false # whether to reset discovery state (if true, will ignore existing discovery output)
+  overwrite_output: false # whether to overwrite existing classification output file (if true, will overwrite)
