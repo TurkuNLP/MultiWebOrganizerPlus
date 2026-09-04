@@ -3,7 +3,7 @@
 MultiWebOrganizerPlus is a two-stage, vLLM-based pipeline for assigning topic
 labels to documents. The first stage discovers and reconciles an evolving
 taxonomy. The second stage classifies the corpus against the resulting frozen
-taxonomy. The seed labels are derived from (WebOrganizer)[https://github.com/CodeCreator/WebOrganizer], but the pipeline is designed to work with any seed taxonomy.
+taxonomy. The seed labels are derived from [WebOrganizer](https://github.com/CodeCreator/WebOrganizer), but the pipeline is designed to work with any seed taxonomy.
 
 ## Pipeline Logic
 
