@@ -7,6 +7,20 @@ from typing import Callable, Optional
 from label_pipeline_lib.common import LOGGER
 
 
+def format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or hours:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
 def detect_num_gpus(preferred: Optional[int] = None) -> int:
     """Detect available GPU devices.
 
@@ -94,7 +108,7 @@ def start_compute_logger(
             gpu_hours_used = (elapsed * float(num_gpus)) / 3600.0
 
             summary = [
-                f"elapsed={elapsed:.0f}s",
+                f"elapsed={format_duration(elapsed)}",
                 f"gpus={num_gpus}",
                 f"gpu-hours-used={gpu_hours_used:.4f}",
             ]
@@ -107,7 +121,7 @@ def start_compute_logger(
                     secs_left = remaining / rate
                     gpu_hours_left = (secs_left * float(num_gpus)) / 3600.0
                     summary.append(f"processed={processed}/{total}")
-                    summary.append(f"eta={secs_left:.0f}s")
+                    summary.append(f"eta={format_duration(secs_left)}")
                     summary.append(f"gpu-hours-remaining={gpu_hours_left:.4f}")
                 else:
                     summary.append(f"processed={processed}/{total}")

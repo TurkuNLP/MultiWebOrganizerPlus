@@ -150,7 +150,7 @@ def run_classification(args: argparse.Namespace) -> None:
     seen_input_ids: set[str] = set()
     next_seq = last_seq + 1
     processed_this_run = 0
-    total_input = 0
+    total_input = sum(1 for _ in stream_documents(input_path))
 
     # Optionally start compute logger
     stop_event = None
@@ -166,9 +166,7 @@ def run_classification(args: argparse.Namespace) -> None:
 
     try:
         def pending_docs() -> Iterator[InputDocument]:
-            nonlocal total_input
             for doc in stream_documents(input_path):
-                total_input += 1
                 if doc.doc_id in seen_input_ids:
                     raise ValueError(f"Duplicate doc_id {doc.doc_id!r} in input corpus")
                 seen_input_ids.add(doc.doc_id)

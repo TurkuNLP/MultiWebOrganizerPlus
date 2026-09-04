@@ -711,7 +711,7 @@ def run_discovery(args: argparse.Namespace) -> None:
     seen_input_ids: set[str] = set()
     next_seq = last_seq + 1
     processed_this_run = 0
-    total_input = 0
+    total_input = sum(1 for _ in stream_documents(input_path))
 
     # Optionally start compute logger
     stop_event = None
@@ -728,9 +728,7 @@ def run_discovery(args: argparse.Namespace) -> None:
     try:
 
         def pending_docs() -> Iterator[InputDocument]:
-            nonlocal total_input
             for doc in stream_documents(input_path):
-                total_input += 1
                 if doc.doc_id in seen_input_ids:
                     raise ValueError(f"Duplicate doc_id {doc.doc_id!r} in input corpus")
                 seen_input_ids.add(doc.doc_id)
@@ -783,33 +781,33 @@ def run_discovery(args: argparse.Namespace) -> None:
             append_models_jsonl(discovery_output, records)
             for record in records:
                 completed_ids.add(record.doc_id)
-                processed_this_run += len(records)
-                last_seq = records[-1].seq
+            processed_this_run += len(records)
+            last_seq = records[-1].seq
 
-                LOGGER.info(
-                    "Discovery: persisted %d documents this run; latest seq=%d; taxonomy v%d",
-                    processed_this_run,
-                    last_seq,
-                    state.schema_version,
+            LOGGER.info(
+                "Discovery: persisted %d documents this run; latest seq=%d; taxonomy v%d",
+                processed_this_run,
+                last_seq,
+                state.schema_version,
+            )
+
+            if last_seq - state.last_reconciled_discovery_seq >= args.reconcile_every:
+                state = reconcile_pending(
+                    model=model,
+                    state=state,
+                    discovery_output=discovery_output,
+                    taxonomy_path=taxonomy_path,
+                    max_total_labels=args.max_total_labels,
+                    min_create_support=args.min_create_support,
+                    max_reconcile_groups=args.max_reconcile_groups,
+                    reconcile_max_tokens=args.reconcile_max_tokens,
+                    final_maintenance=False,
                 )
-
-                if last_seq - state.last_reconciled_discovery_seq >= args.reconcile_every:
-                    state = reconcile_pending(
-                        model=model,
-                        state=state,
-                        discovery_output=discovery_output,
-                        taxonomy_path=taxonomy_path,
-                        max_total_labels=args.max_total_labels,
-                        min_create_support=args.min_create_support,
-                        max_reconcile_groups=args.max_reconcile_groups,
-                        reconcile_max_tokens=args.reconcile_max_tokens,
-                        final_maintenance=False,
-                    )
-                    LOGGER.info(
-                        "Reconciled taxonomy: version=%d active_labels=%d",
-                        state.schema_version,
-                        len(active_labels(state)),
-                    )
+                LOGGER.info(
+                    "Reconciled taxonomy: version=%d active_labels=%d",
+                    state.schema_version,
+                    len(active_labels(state)),
+                )
 
     finally:
         if stop_event is not None:

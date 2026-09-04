@@ -179,6 +179,11 @@ def main() -> None:
                 ("reconcile", "max_total_labels"): "max_total_labels",
                 ("reconcile", "expected_seed_label_count"): "expected_seed_label_count",
                 ("runtime", "log_level"): "log_level",
+                ("runtime", "compute_logging"): "compute_logging",
+                (
+                    "runtime",
+                    "compute_logging_interval",
+                ): "compute_logging_interval",
                 ("runtime", "reset_discovery"): "reset_discovery",
                 ("runtime", "overwrite_output"): "overwrite_output",
             }
