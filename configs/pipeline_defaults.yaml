@@ -10,7 +10,7 @@ model:
   max_document_tokens: 8192
   classification_max_tokens: 4096
   reconcile_max_tokens: 8192
-  tensor_parallel_size: 2
+  tensor_parallel_size: 4
   gpu_memory_utilization: 0.90
   dtype: "auto"
   seed: 0
@@ -35,13 +35,15 @@ discovery:
   max_assigned_labels_per_doc: 5
 
 reconcile:
-  reconcile_every: 128
+  reconcile_every: 2048
   max_reconcile_groups: 128
   min_create_support: 2
   max_total_labels: 100
   expected_seed_label_count: 24
 
 runtime:
-  log_level: "INFO"  # one of: DEBUG, INFO, WARNING, ERROR
+  log_level: "WARNING"  # one of: DEBUG, INFO, WARNING, ERROR
+  compute_logging: true # whether to log elapsed time and GPU-hours estimates
+  compute_logging_interval: 300 # seconds between compute-logging messages, if compute_logging is true
   reset_discovery: false # whether to reset discovery state (if true, will ignore existing discovery output)
   overwrite_output: false # whether to overwrite existing classification output file (if true, will overwrite)
