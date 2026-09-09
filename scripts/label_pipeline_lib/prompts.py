@@ -150,7 +150,7 @@ def build_proposal_screening_messages(
         "It does NOT create a label now.\n\n"
         "3. `discard_candidate`\n"
         "Use when the proposal should not remain a taxonomy candidate: for example it is too narrow, document-specific, incidental, "
-        "incoherent, unlikely to recur, or not a useful distinction for this taxonomy.\n\n"
+        "incoherent, highly unlikely to recur, or not a useful distinction for this taxonomy.\n\n"
         "Rules:\n"
         "- Resolve every supplied proposal group exactly once.\n"
         "- Each decision contains exactly one proposal_group_id.\n"
