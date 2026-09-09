@@ -73,10 +73,8 @@ classification output again.
 ## Repository Layout
 
 - `scripts/label_pipeline.py`: command-line entrypoint.
-- `scripts/label_pipeline_lib/`: configuration, model calls, discovery,
+- `scripts/label_pipeline_lib/`: configuration, Pydantic schemas, model calls, discovery,
 	reconciliation, classification, persistence, and validation logic.
-- `scripts/schemas.py`: Pydantic schemas for input, model output, taxonomy,
-	and result files.
 - `configs/seed_labels/topics.yaml`: seed taxonomy labels.
 - `configs/pipeline_defaults.yaml`: example defaults for a debug run.
 - `configs/full_run1.yaml`: LUMI/full-run configuration template.
