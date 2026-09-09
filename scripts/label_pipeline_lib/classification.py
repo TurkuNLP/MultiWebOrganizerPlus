@@ -13,6 +13,7 @@ from label_pipeline_lib.common import (
     append_models_jsonl,
     atomic_write_model,
     batch_iter,
+    count_jsonl_records,
     file_fingerprint,
     iter_jsonl_models,
     load_model_file,
@@ -155,7 +156,7 @@ def run_classification(args: argparse.Namespace) -> None:
     seen_input_ids: set[str] = set()
     next_seq = last_seq + 1
     processed_this_run = 0
-    total_input = sum(1 for _ in stream_documents(input_path))
+    total_input = sum(1 for _ in count_jsonl_records(input_path))
     if len(completed_ids) > total_input:
         raise ValueError(
             f"Classification output contains {len(completed_ids)} records but input "
