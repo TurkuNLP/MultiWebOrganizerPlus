@@ -340,16 +340,36 @@ def screen_new_proposals(
         atomic_write_model(taxonomy_path, state)
         return state
 
-    # ``max_screening_groups`` is a per-model-call bound, not a cap on the
-    # number of novel groups that may occur in one discovery interval. Process
-    # all groups in deterministic chunks, but persist only after every chunk
-    # succeeds. This keeps the screening cursor transactional: if any model call
-    # fails, the on-disk state still points to the old suffix and the whole
-    # interval is safely reprocessed on resume without double-counting support.
-    for group_batch in batch_iter(groups_to_screen, max_screening_groups):
-        result = model.screen_proposals(
-            state, group_batch, max_tokens=maintenance_max_tokens, aspect=aspect
+    # max_screening_groups remains a per-prompt bound. The chunks are
+    # semantically independent because they all screen against the same taxonomy
+    # snapshot, so submit every chunk to vLLM in one scheduler batch. State is
+    # still applied sequentially only after the entire model batch succeeds,
+    # preserving the transactional screening cursor.
+    group_batches = [
+        list(group_batch)
+        for group_batch in batch_iter(groups_to_screen, max_screening_groups)
+    ]
+
+    LOGGER.info(
+        "Maintenance: Screening %d proposal groups in %d concurrent chunks "
+        "against taxonomy v%d",
+        len(groups_to_screen),
+        len(group_batches),
+        state.schema_version,
+    )
+
+    results = model.screen_proposal_batches(
+        state,
+        group_batches,
+        aspect,
+        max_tokens=maintenance_max_tokens,
+    )
+    if len(results) != len(group_batches):
+        raise RuntimeError(
+            f"Expected {len(group_batches)} screening results, got {len(results)}"
         )
+
+    for group_batch, result in zip(group_batches, results, strict=True):
         state = apply_proposal_screening(
             state,
             group_batch,
@@ -572,7 +592,10 @@ def promote_eligible_candidates(
 
         # Re-screen against the current taxonomy immediately before promotion.
         screening = model.screen_proposals(
-            state, selected, max_tokens=maintenance_max_tokens, aspect=aspect
+            state,
+            selected,
+            aspect=aspect,
+            max_tokens=maintenance_max_tokens,
         )
         state = apply_proposal_screening(
             state,
@@ -1160,13 +1183,6 @@ def run_discovery(args: argparse.Namespace) -> None:
             )
 
             if last_seq - state.last_screened_discovery_seq >= args.screen_every:
-                LOGGER.info(
-                    "Maintenance: Screening %d new discovery records (seq %d..%d) against taxonomy v%d",
-                    last_seq - state.last_screened_discovery_seq,
-                    state.last_screened_discovery_seq + 1,
-                    last_seq,
-                    state.schema_version,
-                )
                 state = run_periodic_maintenance(
                     model=model,
                     state=state,

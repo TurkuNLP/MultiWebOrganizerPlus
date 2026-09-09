@@ -149,7 +149,7 @@ class ModelClient:
         input_throughput = input_tokens / elapsed_seconds
         output_throughput = generated_tokens / elapsed_seconds
         LOGGER.info(
-            "Processed %d total tokens in %.3f seconds (%.2f tokens/sec (input: %.2f tokens/sec, output: %.2f tokens/sec))",
+            "Throughput: Processed %d total tokens in %.3f seconds (%.2f tokens/sec (input: %.2f tokens/sec, output: %.2f tokens/sec))",
             input_tokens + generated_tokens,
             elapsed_seconds,
             total_throughput,
@@ -180,19 +180,18 @@ class ModelClient:
                 f"for max_model_len={self.max_model_len}"
             )
 
-        builder = (
-            build_discovery_messages
-            if discovery
-            else build_frozen_classification_messages
-        )
-
         def messages_for(n_tokens: int) -> list[dict[str, str]]:
             if n_tokens >= len(doc_tokens):
                 candidate_text = text
             else:
                 candidate_text = self.tokenizer.decode(doc_tokens[:n_tokens])
                 candidate_text += "\n[TRUNCATED]"
-            return builder(candidate_text, labels, aspect, creativity)
+
+            if discovery:
+                return build_discovery_messages(
+                    candidate_text, labels, aspect, creativity
+                )
+            return build_frozen_classification_messages(candidate_text, labels, aspect)
 
         full_candidate = messages_for(upper)
         if self._chat_token_count(full_candidate) <= prompt_budget:
@@ -227,10 +226,13 @@ class ModelClient:
         min_length = field_schema.get("minLength", 0)
         max_length = field_schema.get("maxLength")
         pattern = field_schema.get("pattern")
+
         repaired = value.strip()
+
         if max_length is not None and len(repaired) > max_length:
             LOGGER.warning(
-                f"{debug_id}: Truncating proposed_labels.{field_name} to maxLength={max_length}"
+                f"{debug_id}: Truncating proposed_labels.{field_name} "
+                f"to maxLength={max_length}"
             )
             repaired = repaired[:max_length]
 
@@ -248,42 +250,46 @@ class ModelClient:
 
             if not re.fullmatch(pattern, repaired):
                 raise ValueError(
-                    f"{debug_id}: Could not repair proposed_labels.{field_name} to satisfy its schema"
+                    f"{debug_id}: Could not repair proposed_labels.{field_name} "
+                    "to satisfy its schema"
                 )
-            else:
-                LOGGER.warning(
-                    f"{debug_id}: Repaired proposed_labels.{field_name} to satisfy its schema"
-                )
+
+            LOGGER.warning(
+                f"{debug_id}: Repaired proposed_labels.{field_name} "
+                "to satisfy its schema"
+            )
 
         if len(repaired) < min_length:
             raise ValueError(
-                f"{debug_id}: Could not repair proposed_labels.{field_name} to its minimum length"
+                f"{debug_id}: Could not repair proposed_labels.{field_name} "
+                "to its minimum length"
             )
+
         return repaired
 
     def _fix_model_output(
-        self, generated_text: str, debug_id: str, schema_spec: StructuredSchemaSpec[M]
+        self,
+        generated_text: str,
+        debug_id: str,
+        schema_spec: StructuredSchemaSpec[M],
     ) -> dict:
-        """
-        Attempts to fix common issues in the model output which may cause validation errors.
-        Is not guaranteed to fix all issues, but can help with some common cases like duplicate label IDs.
-        """
+        """Attempt to repair a small set of known model-output pathologies."""
         payload = json.loads(generated_text)
 
-        # Forcefully deduplicate assigned_label_ids
         if "assigned_label_ids" in payload and isinstance(
             payload["assigned_label_ids"], list
         ):
-            num_assigned_label_ids = len(payload["assigned_label_ids"])
+            assigned_label_ids = payload["assigned_label_ids"]
+            num_assigned_label_ids = len(assigned_label_ids)
             payload["assigned_label_ids"] = list(
                 dict.fromkeys(payload["assigned_label_ids"])
             )
             num_deduplicated = len(payload["assigned_label_ids"])
             if num_deduplicated < num_assigned_label_ids:
                 LOGGER.warning(
-                    f"{debug_id}: "
-                    f"model returned {num_assigned_label_ids - num_deduplicated} duplicate assigned_label_ids; "
-                    f"deduplicated to {num_deduplicated}."
+                    f"{debug_id}: model returned "
+                    f"{num_assigned_label_ids - num_deduplicated} duplicate "
+                    f"assigned_label_ids ({', '.join(assigned_label_ids)}); deduplicated to {num_deduplicated}."
                 )
 
         if "proposed_labels" in payload and isinstance(
@@ -291,9 +297,11 @@ class ModelClient:
         ):
             repaired_labels = []
             signatures = set()
+
             for label in payload["proposed_labels"]:
                 if not isinstance(label, dict):
                     raise TypeError("Each proposed label must be an object")
+
                 for field_name in ("name", "definition"):
                     if field_name in label:
                         try:
@@ -317,6 +325,7 @@ class ModelClient:
                             exc,
                         )
                         continue
+
                     signature = (
                         " ".join(validated_label.name.casefold().split()),
                         " ".join(validated_label.definition.casefold().split()),
@@ -328,8 +337,10 @@ class ModelClient:
                             signature,
                         )
                         continue
+
                     signatures.add(signature)
                     repaired_labels.append(label)
+
             payload["proposed_labels"] = repaired_labels
 
         return payload
@@ -338,15 +349,35 @@ class ModelClient:
         self,
         prompt_items: Sequence[PromptItem],
         *,
-        schema_spec: StructuredSchemaSpec[M],
+        schema_spec: StructuredSchemaSpec[M] | None = None,
+        schema_specs: Sequence[StructuredSchemaSpec[M]] | None = None,
         max_tokens: int,
     ) -> list[M]:
         if not prompt_items:
             return []
 
-        sampling_params = self._sampling_params(
-            schema_spec.json_schema, max_tokens=max_tokens
-        )
+        if (schema_spec is None) == (schema_specs is None):
+            raise ValueError("Provide exactly one of schema_spec or schema_specs")
+
+        if schema_specs is None:
+            if schema_spec is None:
+                raise RuntimeError("schema_spec unexpectedly missing")
+            specs = [schema_spec] * len(prompt_items)
+            sampling_params: SamplingParams | list[SamplingParams] = (
+                self._sampling_params(schema_spec.json_schema, max_tokens=max_tokens)
+            )
+        else:
+            specs = list(schema_specs)
+            if len(specs) != len(prompt_items):
+                raise ValueError(
+                    f"schema_specs has {len(specs)} entries for "
+                    f"{len(prompt_items)} prompts"
+                )
+            sampling_params = [
+                self._sampling_params(spec.json_schema, max_tokens=max_tokens)
+                for spec in specs
+            ]
+
         kwargs: dict[str, Any] = {}
         if self.chat_template_kwargs is not None:
             kwargs["chat_template_kwargs"] = self.chat_template_kwargs
@@ -389,30 +420,38 @@ class ModelClient:
         parsed: list[M] = []
         for index, request_output in enumerate(outputs):
             completion = request_output.outputs[0]
+            current_spec = specs[index]
+
             if completion.finish_reason != "stop":
                 raise RuntimeError(
                     f"{prompt_items[index].debug_id}: generation ended with finish_reason="
                     f"{completion.finish_reason!r}; output may be truncated.\n"
-                    f"Configured max_tokens={sampling_params.max_tokens}\n"
+                    f"Configured max_tokens={max_tokens}\n"
                     f"Generated tokens: {len(completion.token_ids)}\n"
                     f"Generated text:\n{completion.text!r}"
                 )
+
             generated_text = completion.text
             if not generated_text:
                 raise RuntimeError(
                     f"{prompt_items[index].debug_id}: model returned empty output"
                 )
+
             try:
                 fixed_output_json = self._fix_model_output(
-                    generated_text, prompt_items[index].debug_id, schema_spec
+                    generated_text,
+                    prompt_items[index].debug_id,
+                    current_spec,
                 )
-                parsed.append(schema_spec.model_type.model_validate(fixed_output_json))
+                parsed.append(current_spec.model_type.model_validate(fixed_output_json))
             except ValidationError as exc:
                 preview = generated_text[:2000]
                 raise ValueError(
-                    f"{prompt_items[index].debug_id}: model output failed {schema_spec.model_type.__name__} "
-                    f"validation: {exc}. Output preview: {preview!r}"
+                    f"{prompt_items[index].debug_id}: model output failed "
+                    f"{current_spec.model_type.__name__} validation: {exc}. "
+                    f"Output preview: {preview!r}"
                 ) from exc
+
         return parsed
 
     def discover_batch(
@@ -503,6 +542,7 @@ class ModelClient:
                 text=doc.text,
                 labels=labels,
                 aspect=aspect,
+                creativity=None,
                 discovery=False,
                 max_document_tokens=max_document_tokens,
                 output_max_tokens=output_max_tokens,
@@ -627,6 +667,90 @@ class ModelClient:
             )
         return result.model_copy(update={"new_labels": translated_labels})
 
+    def screen_proposal_batches(
+        self,
+        state: TaxonomyState,
+        proposal_batches: Sequence[Sequence[ProposalGroup]],
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> list[ProposalScreeningOutput]:
+        """Screen independent proposal chunks in one vLLM scheduler batch.
+
+        Each chunk keeps its own short local proposal IDs and its own dynamically
+        constrained JSON schema. The chunks all see the same taxonomy snapshot.
+        """
+        batches = [list(batch) for batch in proposal_batches]
+        if not batches:
+            return []
+        if any(not batch for batch in batches):
+            raise ValueError(
+                "screen_proposal_batches does not accept empty proposal batches"
+            )
+        if not aspect:
+            raise ValueError("screen_proposal_batches requires a non-empty aspect")
+
+        valid_target_label_ids = [label.id for label in state.seed_labels] + [
+            label.id for label in state.dynamic_labels
+        ]
+
+        prompt_items: list[PromptItem] = []
+        schema_specs: list[StructuredSchemaSpec[ProposalScreeningOutput]] = []
+        translations: list[dict[str, str]] = []
+
+        prompt_budget = self.max_model_len - max_tokens
+        if prompt_budget <= 0:
+            raise ValueError(
+                f"max_tokens={max_tokens} leaves no prompt budget for "
+                f"max_model_len={self.max_model_len}"
+            )
+
+        for batch_index, proposal_groups in enumerate(batches, start=1):
+            _, local_to_global, model_groups = self._proposal_aliases(proposal_groups)
+            messages = build_proposal_screening_messages(
+                state, model_groups, aspect=aspect
+            )
+            prompt_tokens = self._chat_token_count(messages)
+            if prompt_tokens > prompt_budget:
+                raise ValueError(
+                    f"proposal_screening:batch_{batch_index}:taxonomy_v"
+                    f"{state.schema_version}: prompt is {prompt_tokens} tokens but "
+                    f"only {prompt_budget} prompt tokens are available. Reduce "
+                    "--max-screening-groups or increase --max-model-len."
+                )
+
+            prompt_items.append(
+                PromptItem(
+                    debug_id=(
+                        f"proposal_screening:batch_{batch_index}:"
+                        f"taxonomy_v{state.schema_version}"
+                    ),
+                    messages=messages,
+                )
+            )
+            schema_specs.append(
+                build_proposal_screening_output_schema(
+                    valid_proposal_group_ids=list(local_to_global),
+                    valid_target_label_ids=valid_target_label_ids,
+                )
+            )
+            translations.append(local_to_global)
+
+        results = self._run_structured_chat(
+            prompt_items,
+            schema_specs=schema_specs,
+            max_tokens=max_tokens,
+        )
+        if len(results) != len(batches):
+            raise RuntimeError(
+                f"Expected {len(batches)} screening results, got {len(results)}"
+            )
+
+        return [
+            self._translate_screening_ids(result, local_to_global)
+            for result, local_to_global in zip(results, translations, strict=True)
+        ]
+
     def screen_proposals(
         self,
         state: TaxonomyState,
@@ -638,24 +762,17 @@ class ModelClient:
         if not proposal_groups:
             raise ValueError("screen_proposals requires at least one proposal group")
 
-        if not aspect:
-            raise ValueError("screen_proposals requires a non-empty aspect")
-
-        _, local_to_global, model_groups = self._proposal_aliases(proposal_groups)
-        messages = build_proposal_screening_messages(state, model_groups, aspect=aspect)
-        schema_spec = build_proposal_screening_output_schema(
-            valid_proposal_group_ids=list(local_to_global),
-            valid_target_label_ids=[label.id for label in state.seed_labels]
-            + [label.id for label in state.dynamic_labels],
-        )
-
-        result = self._run_single_structured_task(
-            debug_id=f"proposal_screening:taxonomy_v{state.schema_version}",
-            messages=messages,
-            schema_spec=schema_spec,
+        results = self.screen_proposal_batches(
+            state,
+            [proposal_groups],
+            aspect,
             max_tokens=max_tokens,
         )
-        return self._translate_screening_ids(result, local_to_global)
+        if len(results) != 1:
+            raise RuntimeError(
+                f"screen_proposals expected one result, got {len(results)}"
+            )
+        return results[0]
 
     def promote_candidates(
         self,
@@ -675,7 +792,10 @@ class ModelClient:
 
         _, local_to_global, model_groups = self._proposal_aliases(candidate_groups)
         messages = build_candidate_promotion_messages(
-            state, model_groups, max_new_labels=max_new_labels, aspect=aspect
+            state,
+            model_groups,
+            max_new_labels=max_new_labels,
+            aspect=aspect,
         )
         schema_spec = build_candidate_promotion_output_schema(
             valid_candidate_group_ids=list(local_to_global),
@@ -699,7 +819,6 @@ class ModelClient:
     ) -> FinalMergeOutput:
         if not state.dynamic_labels:
             return FinalMergeOutput(merges=[])
-
         if not aspect:
             raise ValueError("final_merge_pass requires a non-empty aspect")
 
