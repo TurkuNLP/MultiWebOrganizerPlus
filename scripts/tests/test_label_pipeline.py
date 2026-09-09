@@ -438,6 +438,24 @@ class _KeepAllScreeningModel:
             ]
         )
 
+    def screen_proposal_batches(
+        self,
+        state: TaxonomyState,
+        proposal_batches: list[list[ProposalGroup]],
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> list[ProposalScreeningOutput]:
+        return [
+            self.screen_proposals(
+                state,
+                proposal_groups,
+                aspect,
+                max_tokens=max_tokens,
+            )
+            for proposal_groups in proposal_batches
+        ]
+
 
 def _write_discovery_records(path: Path, count: int) -> None:
     records = [
@@ -834,6 +852,24 @@ class _EndToEndDiscoveryModel:
                 for group in proposal_groups
             ]
         )
+
+    def screen_proposal_batches(
+        self,
+        state: TaxonomyState,
+        proposal_batches: list[list[ProposalGroup]],
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> list[ProposalScreeningOutput]:
+        return [
+            self.screen_proposals(
+                state,
+                proposal_groups,
+                aspect,
+                max_tokens=max_tokens,
+            )
+            for proposal_groups in proposal_batches
+        ]
 
     def promote_candidates(
         self,
