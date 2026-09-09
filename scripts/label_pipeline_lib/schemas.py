@@ -1,12 +1,19 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Literal, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator  # type: ignore[import]
 
 
 class StrictModel(BaseModel):
     """Base class for data that must validate without silent coercion."""
+
+    # Constrain the name and definition fields to start with a letter
+    # and contain only letters, digits, spaces, and a limited set of punctuation.
+    # This should limit the risk of malformed or nonsensical labels.
+    NAME_AND_DEFINITION_PATTERN: ClassVar[str] = r"^[A-Za-z][A-Za-z0-9 .,()'&/+\-:;]*$"
+    LABEL_NAME_MAX_LENGTH: ClassVar[int] = 80
+    LABEL_DEFINITION_MAX_LENGTH: ClassVar[int] = 500
 
     model_config = ConfigDict(
         extra="forbid",
@@ -40,8 +47,16 @@ class DynamicLabelDef(LabelDef):
 
 
 class ProposedLabel(StrictModel):
-    name: str = Field(min_length=1, max_length=50)
-    definition: str = Field(min_length=1, max_length=500)
+    name: str = Field(
+        min_length=1,
+        max_length=StrictModel.LABEL_NAME_MAX_LENGTH,
+        pattern=StrictModel.NAME_AND_DEFINITION_PATTERN,
+    )
+    definition: str = Field(
+        min_length=1,
+        max_length=StrictModel.LABEL_DEFINITION_MAX_LENGTH,
+        pattern=StrictModel.NAME_AND_DEFINITION_PATTERN,
+    )
 
 
 class ProposedLabelRecord(ProposedLabel):
@@ -133,8 +148,16 @@ class ProposalGroup(StrictModel):
     """Deterministically grouped proposal evidence used during discovery."""
 
     group_id: str = Field(min_length=1)
-    name: str = Field(min_length=1, max_length=50)
-    definition: str = Field(min_length=1, max_length=500)
+    name: str = Field(
+        min_length=1,
+        max_length=StrictModel.LABEL_NAME_MAX_LENGTH,
+        pattern=StrictModel.NAME_AND_DEFINITION_PATTERN,
+    )
+    definition: str = Field(
+        min_length=1,
+        max_length=StrictModel.LABEL_DEFINITION_MAX_LENGTH,
+        pattern=StrictModel.NAME_AND_DEFINITION_PATTERN,
+    )
     support_count: int = Field(ge=1)
 
 
@@ -193,8 +216,16 @@ class PromotedCandidateLabel(StrictModel):
     """One new label defined from one or more semantically equivalent candidates."""
 
     candidate_group_ids: list[str] = Field(min_length=1)
-    name: str = Field(min_length=1, max_length=50)
-    definition: str = Field(min_length=1, max_length=500)
+    name: str = Field(
+        min_length=1,
+        max_length=StrictModel.LABEL_NAME_MAX_LENGTH,
+        pattern=StrictModel.NAME_AND_DEFINITION_PATTERN,
+    )
+    definition: str = Field(
+        min_length=1,
+        max_length=StrictModel.LABEL_DEFINITION_MAX_LENGTH,
+        pattern=StrictModel.NAME_AND_DEFINITION_PATTERN,
+    )
 
     @field_validator("candidate_group_ids")
     @classmethod
@@ -259,8 +290,16 @@ class FinalRevisionDecision(StrictModel):
     """Clarify one surviving dynamic label without changing its semantic category."""
 
     label_id: str = Field(min_length=1)
-    name: str = Field(min_length=1, max_length=50)
-    definition: str = Field(min_length=1, max_length=500)
+    name: str = Field(
+        min_length=1,
+        max_length=StrictModel.LABEL_NAME_MAX_LENGTH,
+        pattern=StrictModel.NAME_AND_DEFINITION_PATTERN,
+    )
+    definition: str = Field(
+        min_length=1,
+        max_length=StrictModel.LABEL_DEFINITION_MAX_LENGTH,
+        pattern=StrictModel.NAME_AND_DEFINITION_PATTERN,
+    )
 
 
 class FinalRevisionOutput(StrictModel):

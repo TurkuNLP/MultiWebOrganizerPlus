@@ -88,7 +88,6 @@ def build_frozen_classification_messages(
     text: str,
     labels: Sequence[LabelDef],
     aspect: str,
-    creativity=None,  # ignored for frozen classification
 ) -> list[dict[str, str]]:
     system = (
         f"You are a document categorization engine. Classify the document with respect to {aspect}. "
