@@ -20,9 +20,9 @@ from label_pipeline_lib.common import (
     taxonomy_hash,
     validate_taxonomy_state,
 )
+from label_pipeline_lib.compute_logger import detect_num_gpus, start_compute_logger
 from label_pipeline_lib.model import ModelClient
-from label_pipeline_lib.compute_logger import start_compute_logger, detect_num_gpus
-from schemas import (
+from label_pipeline_lib.schemas import (
     ClassificationRunMetadata,
     FinalClassificationRecord,
     InputDocument,
@@ -54,6 +54,7 @@ def build_classification_metadata(
         max_model_len=args.max_model_len,
         max_document_tokens=args.max_document_tokens,
         classification_max_tokens=args.classification_max_tokens,
+        max_assigned_labels_per_doc=args.max_assigned_labels_per_doc,
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         dtype=args.dtype,
@@ -136,6 +137,10 @@ def run_classification(args: argparse.Namespace) -> None:
                 f"Existing output record {record.doc_id} has a different taxonomy hash"
             )
 
+    frozen_taxonomy_hash = state.frozen_taxonomy_hash
+    if frozen_taxonomy_hash is None:
+        raise RuntimeError("Validated frozen taxonomy unexpectedly has no frozen hash")
+
     labels_snapshot = active_labels(state)
     model = ModelClient(
         model_name=args.model,
@@ -151,12 +156,20 @@ def run_classification(args: argparse.Namespace) -> None:
     next_seq = last_seq + 1
     processed_this_run = 0
     total_input = sum(1 for _ in stream_documents(input_path))
+    if len(completed_ids) > total_input:
+        raise ValueError(
+            f"Classification output contains {len(completed_ids)} records but input "
+            f"contains only {total_input} documents"
+        )
+    total_pending = total_input - len(completed_ids)
 
-    # Optionally start compute logger
+    # Optionally start compute logger. ETA is based on work remaining in this run,
+    # not the full corpus size, so resumed runs report meaningful estimates.
     stop_event = None
-    if getattr(args, "compute_logging", False):
+    if getattr(args, "compute_logging", False) and total_pending > 0:
+
         def _get_progress() -> tuple[int, int]:
-            return processed_this_run, total_input
+            return processed_this_run, total_pending
 
         stop_event = start_compute_logger(
             interval=getattr(args, "compute_logging_interval", 300.0),
@@ -165,6 +178,7 @@ def run_classification(args: argparse.Namespace) -> None:
         )
 
     try:
+
         def pending_docs() -> Iterator[InputDocument]:
             for doc in stream_documents(input_path):
                 if doc.doc_id in seen_input_ids:
@@ -193,7 +207,7 @@ def run_classification(args: argparse.Namespace) -> None:
                     seq=next_seq + index,
                     doc_id=doc.doc_id,
                     taxonomy_version=state.schema_version,
-                    taxonomy_hash=state.frozen_taxonomy_hash or taxonomy_hash(state),
+                    taxonomy_hash=frozen_taxonomy_hash,
                     assigned_label_ids=output.assigned_label_ids,
                 )
                 for index, (doc, output) in enumerate(zip(batch, outputs, strict=True))
@@ -216,6 +230,13 @@ def run_classification(args: argparse.Namespace) -> None:
 
     if total_input == 0:
         raise ValueError("Input corpus contains no documents")
+
+    missing_completed = completed_ids - seen_input_ids
+    if missing_completed:
+        raise ValueError(
+            "Classification output contains document IDs absent from the input corpus: "
+            f"{sorted(missing_completed)[:10]}"
+        )
 
     LOGGER.info(
         "Frozen classification complete. %d documents processed this run; "

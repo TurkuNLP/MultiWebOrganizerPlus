@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from label_pipeline_lib.common import LOGGER
 
@@ -21,48 +22,37 @@ def format_duration(seconds: float) -> str:
     return " ".join(parts)
 
 
-def detect_num_gpus(preferred: Optional[int] = None) -> int:
-    """Detect available GPU devices.
+def detect_num_gpus(preferred: int | None = None) -> int:
+    """Return the number of GPUs whose compute should be accounted for.
 
-    Strategy (in order):
-    - Try to use PyTorch if available (torch.cuda.device_count()).
-    - Fall back to CUDA_VISIBLE_DEVICES env var (comma-separated indices/UUIDs).
-    - Finally return preferred if provided, otherwise 1.
+    When ``preferred`` is supplied, it represents the number of GPUs configured
+    for this pipeline run (currently ``tensor_parallel_size``) and is therefore
+    the correct value for GPU-hour accounting even if the job can see additional
+    devices.
+
+    If no configured count is supplied, fall back to visible-device detection.
     """
+    if preferred is not None:
+        if preferred < 1:
+            raise ValueError("preferred GPU count must be >= 1")
+        return preferred
+
     try:
         import torch
 
         if getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
-            try:
-                cnt = int(torch.cuda.device_count())
-                if cnt > 0:
-                    return cnt
-            except Exception:
-                # Fall through to other methods
-                pass
-    except Exception:
-        # PyTorch not available or failed; continue
+            count = int(torch.cuda.device_count())
+            if count > 0:
+                return count
+    except (ImportError, RuntimeError):
         pass
 
-    # Check environment variable
-    try:
-        import os
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible:
+        devices = [item.strip() for item in visible.split(",") if item.strip()]
+        if devices:
+            return len(devices)
 
-        env = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if env:
-            # remove empty entries
-            parts = [p for p in env.split(",") if p.strip() != ""]
-            if parts:
-                try:
-                    return max(1, len(parts))
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    # Fallbacks
-    if preferred is not None and preferred > 0:
-        return preferred
     return 1
 
 
@@ -71,23 +61,22 @@ def start_compute_logger(
     interval: float,
     num_gpus: int,
     get_progress: Callable[[], tuple[int, int]],
-    stop_event: Optional[threading.Event] = None,
+    stop_event: threading.Event | None = None,
 ) -> threading.Event:
-    """Start a background thread that periodically logs compute usage.
+    """Start a daemon thread that periodically logs elapsed compute and ETA.
 
-    - interval: seconds between log messages
-    - num_gpus: number of GPUs assumed in use
-    - get_progress: callable returning (processed, total)
-
-    Returns the threading.Event used to stop the logger. The caller may set
-    this event to stop the background thread; it will also be set when the
-    thread finishes.
+    ``get_progress`` must return ``(processed_this_run, total_to_process_this_run)``.
+    This distinction matters when resuming a partially completed run.
     """
+    if interval <= 0:
+        raise ValueError("compute logging interval must be > 0")
+    if num_gpus < 1:
+        raise ValueError("num_gpus must be >= 1")
 
     if stop_event is None:
         stop_event = threading.Event()
 
-    start_time = time.time()
+    start_time = time.monotonic()
 
     def worker() -> None:
         LOGGER.info(
@@ -96,47 +85,42 @@ def start_compute_logger(
             num_gpus,
         )
         while not stop_event.wait(interval):
-            now = time.time()
-            elapsed = now - start_time
+            elapsed = time.monotonic() - start_time
             try:
                 processed, total = get_progress()
-            except Exception as exc:  # defensive
+            except Exception as exc:  # Logging must not terminate model inference.
                 LOGGER.exception("Compute logger: failed to fetch progress: %s", exc)
                 continue
 
-            # Basic GPU-hours consumed so far
-            gpu_hours_used = (elapsed * float(num_gpus)) / 3600.0
+            if processed < 0 or total < 0:
+                LOGGER.error(
+                    "Compute logger received invalid progress: processed=%d total=%d",
+                    processed,
+                    total,
+                )
+                continue
 
+            gpu_hours_used = (elapsed * float(num_gpus)) / 3600.0
             summary = [
                 f"elapsed={format_duration(elapsed)}",
                 f"gpus={num_gpus}",
                 f"gpu-hours-used={gpu_hours_used:.4f}",
+                f"processed={processed}/{total}",
             ]
 
-            remaining_msg = ""
-            if total and processed > 0:
+            if total > 0 and processed > 0:
                 rate = processed / elapsed if elapsed > 0 else 0.0
                 if rate > 0:
-                    remaining = total - processed
-                    secs_left = remaining / rate
-                    gpu_hours_left = (secs_left * float(num_gpus)) / 3600.0
-                    summary.append(f"processed={processed}/{total}")
-                    summary.append(f"eta={format_duration(secs_left)}")
+                    remaining = max(0, total - processed)
+                    seconds_left = remaining / rate
+                    gpu_hours_left = (seconds_left * float(num_gpus)) / 3600.0
+                    summary.append(f"eta={format_duration(seconds_left)}")
                     summary.append(f"gpu-hours-remaining={gpu_hours_left:.4f}")
                 else:
-                    summary.append(f"processed={processed}/{total}")
                     summary.append("eta=unknown (rate=0)")
-            else:
-                # When total is unknown or nothing processed yet, just report processed if available
-                if total:
-                    summary.append(f"processed={processed}/{total}")
-                else:
-                    summary.append(f"processed={processed}")
 
             LOGGER.info("Compute: %s", ", ".join(summary))
 
-        # Mark stop_event when exiting
-        stop_event.set()
         LOGGER.info("Compute logger stopped")
 
     thread = threading.Thread(target=worker, name="compute-logger", daemon=True)

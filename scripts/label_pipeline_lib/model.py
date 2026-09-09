@@ -15,26 +15,34 @@ except ImportError:
 
 from label_pipeline_lib.common import LOGGER
 from label_pipeline_lib.prompts import (
+    build_candidate_promotion_messages,
     build_discovery_messages,
+    build_final_merge_messages,
+    build_final_revision_messages,
     build_frozen_classification_messages,
-    build_reconciliation_messages,
+    build_proposal_screening_messages,
 )
 from label_pipeline_lib.structured_schemas import (
-    StructuredSchemaSpec,
     PromptItem,
-    build_discovery_output_schema,
+    StructuredSchemaSpec,
+    build_candidate_promotion_output_schema,
     build_classification_output_schema,
-    build_reconciliation_output_schema,
+    build_discovery_output_schema,
+    build_final_merge_output_schema,
+    build_final_revision_output_schema,
+    build_proposal_screening_output_schema,
 )
-from schemas import (
+from label_pipeline_lib.schemas import (
+    CandidatePromotionOutput,
+    FinalMergeOutput,
+    FinalRevisionOutput,
     FrozenClassificationOutputSchema,
     InputDocument,
     LabelDef,
     LabellingOutputSchema,
     ProposalGroup,
-    ReconciliationOutput,
+    ProposalScreeningOutput,
     TaxonomyState,
-    FinalReconciliationOutput,
 )
 
 M = TypeVar("M", bound=BaseModel)
@@ -62,6 +70,7 @@ class ModelClient:
             gpu_memory_utilization=gpu_memory_utilization,
             dtype=dtype,
             max_model_len=max_model_len,
+            performance_mode="throughput",
             seed=seed,
         )
         self.tokenizer = self.llm.get_tokenizer()
@@ -152,6 +161,7 @@ class ModelClient:
         text: str,
         labels: Sequence[LabelDef],
         aspect: str,
+        creativity: str | None,
         discovery: bool,
         max_document_tokens: int,
         output_max_tokens: int,
@@ -180,7 +190,7 @@ class ModelClient:
             else:
                 candidate_text = self.tokenizer.decode(doc_tokens[:n_tokens])
                 candidate_text += "\n[TRUNCATED]"
-            return builder(candidate_text, labels, aspect)
+            return builder(candidate_text, labels, aspect, creativity)
 
         full_candidate = messages_for(upper)
         if self._chat_token_count(full_candidate) <= prompt_budget:
@@ -208,7 +218,7 @@ class ModelClient:
         self,
         prompt_items: Sequence[PromptItem],
         *,
-        schema_spec: StructuredSchemaSpec,
+        schema_spec: StructuredSchemaSpec[M],
         max_tokens: int,
     ) -> list[M]:
         if not prompt_items:
@@ -232,8 +242,22 @@ class ModelClient:
             **kwargs,
         )
 
-        # Log throughput
         generate_end_time = time.time()
+        if len(outputs) != len(messages):
+            raise RuntimeError(
+                f"vLLM returned {len(outputs)} outputs for {len(messages)} prompts"
+            )
+
+        # Validate output cardinality before indexing completions for throughput
+        # accounting, so malformed vLLM responses fail with the prompt debug ID
+        # instead of an unrelated IndexError.
+        for index, request_output in enumerate(outputs):
+            if len(request_output.outputs) != 1:
+                raise RuntimeError(
+                    f"{prompt_items[index].debug_id}: expected exactly one completion, "
+                    f"got {len(request_output.outputs)}"
+                )
+
         input_tokens = sum(len(output.prompt_token_ids) for output in outputs)
         generated_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
         self._log_model_throughput(
@@ -241,18 +265,9 @@ class ModelClient:
             generated_tokens=generated_tokens,
             elapsed_seconds=generate_end_time - generate_start_time,
         )
-        if len(outputs) != len(messages):
-            raise RuntimeError(
-                f"vLLM returned {len(outputs)} outputs for {len(messages)} prompts"
-            )
 
         parsed: list[M] = []
         for index, request_output in enumerate(outputs):
-            if len(request_output.outputs) != 1:
-                raise RuntimeError(
-                    f"{prompt_items[index].debug_id}: expected exactly one completion, "
-                    f"got {len(request_output.outputs)}"
-                )
             completion = request_output.outputs[0]
             if completion.finish_reason != "stop":
                 raise RuntimeError(
@@ -302,6 +317,7 @@ class ModelClient:
         labels: Sequence[LabelDef],
         *,
         aspect: str,
+        creativity: str | None,
         max_document_tokens: int,
         output_max_tokens: int,
         max_assigned_labels_per_doc: int,
@@ -315,6 +331,7 @@ class ModelClient:
                 text=doc.text,
                 labels=labels,
                 aspect=aspect,
+                creativity=creativity,
                 discovery=True,
                 max_document_tokens=max_document_tokens,
                 output_max_tokens=output_max_tokens,
@@ -350,6 +367,12 @@ class ModelClient:
                 raise ValueError(
                     f"Document {doc.doc_id}: model returned unknown label IDs "
                     f"{sorted(unknown)}"
+                )
+            if len(result.assigned_label_ids) > max_assigned_labels_per_doc:
+                raise ValueError(
+                    f"Document {doc.doc_id}: model assigned {len(result.assigned_label_ids)} "
+                    f"labels, exceeding --max-assigned-labels-per-doc="
+                    f"{max_assigned_labels_per_doc}"
                 )
             if len(result.proposed_labels) > max_proposals_per_doc:
                 raise ValueError(
@@ -409,97 +432,219 @@ class ModelClient:
                     f"Document {doc.doc_id}: model returned unknown label IDs "
                     f"{sorted(unknown)}"
                 )
+            if len(result.assigned_label_ids) > max_assigned_labels_per_doc:
+                raise ValueError(
+                    f"Document {doc.doc_id}: model assigned {len(result.assigned_label_ids)} "
+                    f"labels, exceeding --max-assigned-labels-per-doc="
+                    f"{max_assigned_labels_per_doc}"
+                )
         return results
 
-    def reconcile(
+    def _run_single_structured_task(
         self,
-        state: TaxonomyState,
-        proposal_groups: Sequence[ProposalGroup],
         *,
-        max_total_labels: int,
-        min_create_support: int,
+        debug_id: str,
+        messages: list[dict[str, str]],
+        schema_spec: StructuredSchemaSpec[M],
         max_tokens: int,
-        final_maintenance: bool,
-    ) -> ReconciliationOutput | FinalReconciliationOutput:
-
-        # Build short model-facing ID aliases for proposal groups to reduce token usage in the prompt
-        global_to_local = {
-            group.group_id: f"P{i:03d}"
-            for i, group in enumerate(proposal_groups, start=1)
-        }
-
-        local_to_global = {
-            local_id: global_id for global_id, local_id in global_to_local.items()
-        }
-
-        model_proposal_groups = [
-            group.model_copy(update={"group_id": global_to_local[group.group_id]})
-            for group in proposal_groups
-        ]
-
-        prompt_items: list[PromptItem] = []
-
-        messages = build_reconciliation_messages(
-            state,
-            model_proposal_groups,
-            max_total_labels=max_total_labels,
-            min_create_support=min_create_support,
-            final_maintenance=final_maintenance,
-        )
-
-        prompt_items.append(
-            PromptItem(
-                debug_id=(
-                    f"reconciliation:"
-                    f"{'final' if final_maintenance else 'periodic'}:"
-                    f"taxonomy_v{state.schema_version}"
-                ),
-                messages=messages,
-            )
-        )
-
+    ) -> M:
         prompt_tokens = self._chat_token_count(messages)
         prompt_budget = self.max_model_len - max_tokens
         if prompt_tokens > prompt_budget:
             raise ValueError(
-                f"Reconciliation prompt is {prompt_tokens} tokens but only "
-                f"{prompt_budget} prompt tokens are available. Lower "
-                "--reconcile-every/--max-reconcile-groups or increase "
-                "--max-model-len."
+                f"{debug_id}: prompt is {prompt_tokens} tokens but only "
+                f"{prompt_budget} prompt tokens are available. Reduce the task "
+                "size or increase --max-model-len."
             )
 
-        schema_spec = build_reconciliation_output_schema(
-            final_maintenance=final_maintenance,
-            valid_proposal_group_ids=list(local_to_global.keys()),
-        )
-
-        result = self._run_structured_chat(
-            prompt_items,
+        results = self._run_structured_chat(
+            [PromptItem(debug_id=debug_id, messages=messages)],
             schema_spec=schema_spec,
             max_tokens=max_tokens,
-        )[0]
+        )
+        if len(results) != 1:
+            raise RuntimeError(
+                f"{debug_id}: expected exactly one structured result, got {len(results)}"
+            )
+        return results[0]
 
-        # Translate local IDs back to persistent global IDs.
-        translated_resolutions = []
+    @staticmethod
+    def _proposal_aliases(
+        proposal_groups: Sequence[ProposalGroup],
+    ) -> tuple[dict[str, str], dict[str, str], list[ProposalGroup]]:
+        global_to_local = {
+            group.group_id: f"P{i:03d}"
+            for i, group in enumerate(proposal_groups, start=1)
+        }
+        local_to_global = {
+            local_id: global_id for global_id, local_id in global_to_local.items()
+        }
+        model_groups = [
+            group.model_copy(update={"group_id": global_to_local[group.group_id]})
+            for group in proposal_groups
+        ]
+        return global_to_local, local_to_global, model_groups
 
-        for resolution in result.proposal_resolutions:
+    @staticmethod
+    def _translate_screening_ids(
+        result: ProposalScreeningOutput,
+        local_to_global: dict[str, str],
+    ) -> ProposalScreeningOutput:
+        translated = []
+        for decision in result.decisions:
+            local_id = decision.proposal_group_id
+            if local_id not in local_to_global:
+                raise ValueError(
+                    f"Proposal screener returned unknown local proposal ID {local_id!r}"
+                )
+            translated.append(
+                decision.model_copy(
+                    update={"proposal_group_id": local_to_global[local_id]}
+                )
+            )
+        return result.model_copy(update={"decisions": translated})
+
+    @staticmethod
+    def _translate_promotion_ids(
+        result: CandidatePromotionOutput,
+        local_to_global: dict[str, str],
+    ) -> CandidatePromotionOutput:
+        translated_labels = []
+        for new_label in result.new_labels:
             translated_ids = []
-
-            for local_id in resolution.proposal_group_ids:
+            for local_id in new_label.candidate_group_ids:
                 if local_id not in local_to_global:
                     raise ValueError(
-                        f"Reconciler returned unknown local proposal ID "
-                        f"{local_id!r}"
+                        f"Candidate promoter returned unknown local candidate ID {local_id!r}"
                     )
-
                 translated_ids.append(local_to_global[local_id])
-
-            translated_resolutions.append(
-                resolution.model_copy(update={"proposal_group_ids": translated_ids})
+            translated_labels.append(
+                new_label.model_copy(update={"candidate_group_ids": translated_ids})
             )
+        return result.model_copy(update={"new_labels": translated_labels})
 
-        result = result.model_copy(
-            update={"proposal_resolutions": translated_resolutions}
+    def screen_proposals(
+        self,
+        state: TaxonomyState,
+        proposal_groups: Sequence[ProposalGroup],
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> ProposalScreeningOutput:
+        if not proposal_groups:
+            raise ValueError("screen_proposals requires at least one proposal group")
+
+        if not aspect:
+            raise ValueError("screen_proposals requires a non-empty aspect")
+
+        _, local_to_global, model_groups = self._proposal_aliases(proposal_groups)
+        messages = build_proposal_screening_messages(state, model_groups, aspect=aspect)
+        schema_spec = build_proposal_screening_output_schema(
+            valid_proposal_group_ids=list(local_to_global),
+            valid_target_label_ids=[label.id for label in state.seed_labels]
+            + [label.id for label in state.dynamic_labels],
         )
 
-        return result
+        result = self._run_single_structured_task(
+            debug_id=f"proposal_screening:taxonomy_v{state.schema_version}",
+            messages=messages,
+            schema_spec=schema_spec,
+            max_tokens=max_tokens,
+        )
+        return self._translate_screening_ids(result, local_to_global)
+
+    def promote_candidates(
+        self,
+        state: TaxonomyState,
+        candidate_groups: Sequence[ProposalGroup],
+        aspect: str,
+        *,
+        max_new_labels: int,
+        max_tokens: int,
+    ) -> CandidatePromotionOutput:
+        if not candidate_groups:
+            raise ValueError("promote_candidates requires at least one candidate group")
+        if max_new_labels < 1:
+            raise ValueError("max_new_labels must be >= 1")
+        if not aspect:
+            raise ValueError("promote_candidates requires a non-empty aspect")
+
+        _, local_to_global, model_groups = self._proposal_aliases(candidate_groups)
+        messages = build_candidate_promotion_messages(
+            state, model_groups, max_new_labels=max_new_labels, aspect=aspect
+        )
+        schema_spec = build_candidate_promotion_output_schema(
+            valid_candidate_group_ids=list(local_to_global),
+            max_new_labels=max_new_labels,
+        )
+
+        result = self._run_single_structured_task(
+            debug_id=f"candidate_promotion:taxonomy_v{state.schema_version}",
+            messages=messages,
+            schema_spec=schema_spec,
+            max_tokens=max_tokens,
+        )
+        return self._translate_promotion_ids(result, local_to_global)
+
+    def final_merge_pass(
+        self,
+        state: TaxonomyState,
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> FinalMergeOutput:
+        if not state.dynamic_labels:
+            return FinalMergeOutput(merges=[])
+
+        if not aspect:
+            raise ValueError("final_merge_pass requires a non-empty aspect")
+
+        messages = build_final_merge_messages(state, aspect=aspect)
+        schema_spec = build_final_merge_output_schema(
+            valid_dynamic_label_ids=[label.id for label in state.dynamic_labels],
+            valid_target_label_ids=[label.id for label in state.seed_labels]
+            + [label.id for label in state.dynamic_labels],
+        )
+        return self._run_single_structured_task(
+            debug_id=f"final_merge:taxonomy_v{state.schema_version}",
+            messages=messages,
+            schema_spec=schema_spec,
+            max_tokens=max_tokens,
+        )
+
+    def final_revision_pass(
+        self,
+        state: TaxonomyState,
+        aspect: str,
+        review_label_ids: Sequence[str],
+        *,
+        max_tokens: int,
+    ) -> FinalRevisionOutput:
+        review_ids = list(review_label_ids)
+        if not review_ids:
+            return FinalRevisionOutput(revisions=[])
+        if len(review_ids) != len(set(review_ids)):
+            raise ValueError("review_label_ids contains duplicates")
+        if not aspect:
+            raise ValueError("final_revision_pass requires a non-empty aspect")
+
+        dynamic_ids = {label.id for label in state.dynamic_labels}
+        unknown = set(review_ids) - dynamic_ids
+        if unknown:
+            raise ValueError(
+                f"Final revision requested non-dynamic labels {sorted(unknown)}"
+            )
+
+        messages = build_final_revision_messages(state, review_ids, aspect=aspect)
+        schema_spec = build_final_revision_output_schema(
+            valid_dynamic_label_ids=review_ids,
+        )
+        return self._run_single_structured_task(
+            debug_id=(
+                f"final_revision:taxonomy_v{state.schema_version}:"
+                f"{review_ids[0]}-{review_ids[-1]}"
+            ),
+            messages=messages,
+            schema_spec=schema_spec,
+            max_tokens=max_tokens,
+        )

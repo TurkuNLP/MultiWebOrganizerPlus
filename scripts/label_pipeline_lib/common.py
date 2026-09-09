@@ -4,23 +4,13 @@ import hashlib
 import json
 import logging
 import os
-from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence, TypeVar
 
 import yaml
 from pydantic import BaseModel, ValidationError  # type: ignore
 
-from schemas import (
-    DiscoverySettings,
-    DynamicLabelDef,
-    InputDocument,
-    LabelDef,
-    ProposalGroup,
-    ReconciliationOutput,
-    SchemaHistoryEntry,
-    TaxonomyState,
-)
+from label_pipeline_lib.schemas import InputDocument, LabelDef, TaxonomyState
 
 LOGGER = logging.getLogger("label_pipeline")
 T = TypeVar("T")
@@ -28,11 +18,15 @@ M = TypeVar("M", bound=BaseModel)
 
 
 def configure_logging(level: str = "DEBUG") -> None:
-    """Configure root logging. `level` may be a logging level name (e.g. "DEBUG")."""
-    try:
-        lvl = getattr(logging, level.upper()) if isinstance(level, str) else int(level)
-    except Exception:
-        lvl = logging.INFO
+    """Configure root logging from a standard logging level name."""
+    if not isinstance(level, str):
+        raise TypeError("logging level must be a string")
+
+    normalized = level.upper()
+    lvl = getattr(logging, normalized, None)
+    if not isinstance(lvl, int):
+        raise ValueError(f"Unknown logging level: {level!r}")
+
     logging.basicConfig(
         level=lvl,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -109,6 +103,14 @@ def stream_documents(path: Path) -> Iterator[InputDocument]:
                 ) from exc
 
 
+def count_jsonl_records(path: Path) -> int:
+    """Count JSONL records without parsing each record into a model."""
+    if not path.exists():
+        raise FileNotFoundError(path)
+    with open(path, "rb") as handle:
+        return sum(1 for _ in handle)
+
+
 def batch_iter(iterable: Iterable[T], size: int) -> Iterator[list[T]]:
     if size < 1:
         raise ValueError("batch size must be >= 1")
@@ -142,6 +144,7 @@ def seed_labels_hash(labels: Sequence[LabelDef]) -> str:
 
 
 def taxonomy_hash(state: TaxonomyState) -> str:
+    """Hash only the effective taxonomy, not discovery/audit state."""
     payload = {
         "aspect": state.aspect,
         "seed_labels": [label.model_dump(mode="json") for label in state.seed_labels],
@@ -217,15 +220,13 @@ def validate_taxonomy_state(
     max_total_labels: int | None = None,
     expected_seed_count: int | None = None,
 ) -> None:
+    """Validate state-dependent invariants not expressible in Pydantic fields."""
     if max_total_labels is None:
         max_total_labels = state.discovery_settings.max_total_labels
     if expected_seed_count is None:
         expected_seed_count = state.discovery_settings.expected_seed_label_count
 
-    if (
-        expected_seed_count is not None
-        and len(state.seed_labels) != expected_seed_count
-    ):
+    if len(state.seed_labels) != expected_seed_count:
         raise ValueError(
             f"Taxonomy contains {len(state.seed_labels)} seed labels; "
             f"expected {expected_seed_count}"
@@ -233,13 +234,47 @@ def validate_taxonomy_state(
 
     labels = active_labels(state)
     active_ids = {label.id for label in labels}
-    dynamic_ids = {label.id for label in state.dynamic_labels}
 
-    if max_total_labels is not None and len(labels) > max_total_labels:
+    for label in state.dynamic_labels:
+        if label.created_version < 2:
+            raise ValueError(
+                f"Dynamic label {label.id} has impossible created_version "
+                f"{label.created_version}; dynamic labels are first created at schema version 2"
+            )
+        if label.created_version > label.last_modified_version:
+            raise ValueError(
+                f"Dynamic label {label.id} has created_version "
+                f"{label.created_version} after last_modified_version "
+                f"{label.last_modified_version}"
+            )
+        if label.last_modified_version > state.schema_version:
+            raise ValueError(
+                f"Dynamic label {label.id} has last_modified_version "
+                f"{label.last_modified_version} newer than taxonomy schema_version "
+                f"{state.schema_version}"
+            )
+
+    if len(labels) > max_total_labels:
         raise ValueError(
             f"Taxonomy has {len(labels)} active labels, exceeding cap {max_total_labels}"
         )
 
+    # The ID allocator is monotonic. A rolled-back counter could otherwise reuse
+    # a previously active or retired dynamic ID after state corruption.
+    numeric_used_ids = [
+        int(label_id[1:])
+        for label_id in active_ids | set(state.alias_map)
+        if label_id.startswith("L") and label_id[1:].isdigit()
+    ]
+    if numeric_used_ids and state.next_dynamic_label_num <= max(numeric_used_ids):
+        raise ValueError(
+            "next_dynamic_label_num must be greater than every active or retired "
+            f"numeric L### ID; got {state.next_dynamic_label_num}, "
+            f"maximum used is {max(numeric_used_ids)}"
+        )
+
+    # Every alias source must be retired and every chain must terminate at an
+    # active label. resolve_alias() also detects cycles.
     for source, target in state.alias_map.items():
         if source in active_ids:
             raise ValueError(f"Alias source {source} is still an active label")
@@ -248,12 +283,22 @@ def validate_taxonomy_state(
             raise ValueError(
                 f"Alias {source}->{target} does not resolve to an active label"
             )
-        if source in dynamic_ids:
-            raise ValueError(f"Retired dynamic label {source} is unexpectedly active")
 
-    deferred_ids = [group.group_id for group in state.deferred_proposals]
-    if len(deferred_ids) != len(set(deferred_ids)):
-        raise ValueError("Duplicate deferred proposal group IDs in taxonomy state")
+    # Candidate proposals are discovery evidence, not active labels. They may
+    # remain after freezing, but their persistent IDs and exact normalized
+    # signatures must be unique.
+    candidate_ids = [group.group_id for group in state.candidate_proposals]
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise ValueError("Duplicate candidate proposal group IDs in taxonomy state")
+
+    candidate_signatures = [
+        (normalize_text(group.name), normalize_text(group.definition))
+        for group in state.candidate_proposals
+    ]
+    if len(candidate_signatures) != len(set(candidate_signatures)):
+        raise ValueError(
+            "Duplicate normalized candidate proposal signatures in taxonomy state"
+        )
 
     expected_hash = seed_labels_hash(state.seed_labels)
     if expected_hash != state.seed_labels_sha256:
@@ -266,6 +311,8 @@ def validate_taxonomy_state(
             raise ValueError("Frozen taxonomy is missing frozen metadata")
         if taxonomy_hash(state) != state.frozen_taxonomy_hash:
             raise ValueError("Frozen taxonomy hash does not match taxonomy contents")
+    elif state.frozen_at_unix is not None or state.frozen_taxonomy_hash is not None:
+        raise ValueError("Unfrozen taxonomy must not contain frozen metadata")
 
 
 def next_dynamic_id(state: TaxonomyState) -> str:

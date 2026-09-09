@@ -15,6 +15,7 @@ from label_pipeline_lib.common import (
     append_models_jsonl,
     atomic_write_model,
     batch_iter,
+    count_jsonl_records,
     file_fingerprint,
     iter_jsonl_models,
     load_model_file,
@@ -28,22 +29,25 @@ from label_pipeline_lib.common import (
     validate_taxonomy_state,
     validate_unique_labels,
 )
+from label_pipeline_lib.compute_logger import detect_num_gpus, start_compute_logger
 from label_pipeline_lib.model import ModelClient
-from label_pipeline_lib.compute_logger import start_compute_logger, detect_num_gpus
-from schemas import (
+from label_pipeline_lib.schemas import (
+    CandidatePromotionHistoryEntry,
+    CandidatePromotionOutput,
     DiscoveryRecord,
     DiscoverySettings,
     DynamicLabelDef,
-    DynamicLabelChange,
+    FinalMergeHistoryEntry,
+    FinalMergeOutput,
+    FinalRevisionHistoryEntry,
+    FinalRevisionOutput,
     InputDocument,
     LabelDef,
     ProposalGroup,
-    ProposalResolution,
+    ProposalScreeningHistoryEntry,
+    ProposalScreeningOutput,
     ProposedLabelRecord,
-    ReconciliationOutput,
-    SchemaHistoryEntry,
     TaxonomyState,
-    FinalReconciliationOutput,
 )
 
 
@@ -80,6 +84,13 @@ def scan_discovery_results(
     *,
     after_seq: int,
 ) -> tuple[int, Counter[str], list[ProposalGroup]]:
+    """Scan persisted discovery results and group proposals after ``after_seq``.
+
+    Usage counts are recomputed from the complete persisted discovery file so they
+    remain deterministic after resume. Proposal evidence is returned only for the
+    yet-unscreened suffix of the file.
+    """
+
     usage: Counter[str] = Counter()
     grouped: dict[str, ProposalGroup] = {}
     latest_seq = 0
@@ -102,6 +113,7 @@ def scan_discovery_results(
         if record.doc_id in seen_docs:
             raise ValueError(f"Duplicate doc_id {record.doc_id!r} in {path}")
         seen_docs.add(record.doc_id)
+
         if record.taxonomy_version > state.schema_version:
             raise ValueError(
                 f"Discovery record {record.doc_id} uses taxonomy version "
@@ -127,6 +139,7 @@ def scan_discovery_results(
 
             if record.seq <= after_seq:
                 continue
+
             group_id = proposal_group_id(proposed.name, proposed.definition)
             existing = grouped.get(group_id)
             if existing is None:
@@ -136,242 +149,561 @@ def scan_discovery_results(
                     definition=proposed.definition,
                     support_count=1,
                 )
-            else:
-                if normalize_text(existing.name) != normalize_text(
-                    proposed.name
-                ) or normalize_text(existing.definition) != normalize_text(
-                    proposed.definition
-                ):
-                    raise RuntimeError("Proposal-group hash collision")
-                grouped[group_id] = existing.model_copy(
-                    update={"support_count": existing.support_count + 1}
-                )
+                continue
+
+            if normalize_text(existing.name) != normalize_text(
+                proposed.name
+            ) or normalize_text(existing.definition) != normalize_text(
+                proposed.definition
+            ):
+                raise RuntimeError("Proposal-group hash collision")
+
+            grouped[group_id] = existing.model_copy(
+                update={"support_count": existing.support_count + 1}
+            )
 
     return latest_seq, usage, list(grouped.values())
 
 
 def update_usage_counts(state: TaxonomyState, usage: Counter[str]) -> TaxonomyState:
-    updated = []
-    for label in state.dynamic_labels:
-        updated.append(label.model_copy(update={"usage_count": usage[label.id]}))
+    updated = [
+        label.model_copy(update={"usage_count": usage[label.id]})
+        for label in state.dynamic_labels
+    ]
     return state.model_copy(update={"dynamic_labels": updated})
 
 
-def combine_proposal_groups(
-    deferred: Sequence[ProposalGroup],
+def accumulate_existing_candidate_support(
+    state: TaxonomyState,
     new_groups: Sequence[ProposalGroup],
-) -> list[ProposalGroup]:
-    combined: dict[str, ProposalGroup] = {group.group_id: group for group in deferred}
+) -> tuple[TaxonomyState, list[ProposalGroup]]:
+    """Accumulate exact repeats of already-kept candidates.
+
+    A group that is already in ``candidate_proposals`` has already passed semantic
+    screening, so a later exact normalized recurrence only increments support. New
+    group IDs are returned for screening.
+    """
+
+    candidate_by_id: dict[str, ProposalGroup] = {}
+    for candidate in state.candidate_proposals:
+        if candidate.group_id in candidate_by_id:
+            raise ValueError(
+                f"Duplicate candidate proposal group {candidate.group_id!r} in taxonomy state"
+            )
+        candidate_by_id[candidate.group_id] = candidate
+
+    groups_to_screen: list[ProposalGroup] = []
+
     for group in new_groups:
-        existing = combined.get(group.group_id)
+        existing = candidate_by_id.get(group.group_id)
         if existing is None:
-            combined[group.group_id] = group
+            groups_to_screen.append(group)
             continue
+
         if normalize_text(existing.name) != normalize_text(
             group.name
         ) or normalize_text(existing.definition) != normalize_text(group.definition):
             raise RuntimeError("Proposal-group hash collision")
-        combined[group.group_id] = existing.model_copy(
+
+        candidate_by_id[group.group_id] = existing.model_copy(
             update={"support_count": existing.support_count + group.support_count}
         )
-    return list(combined.values())
+
+    return (
+        state.model_copy(
+            update={"candidate_proposals": list(candidate_by_id.values())}
+        ),
+        groups_to_screen,
+    )
 
 
-def validate_reconciliation_semantics(
+def validate_proposal_screening_semantics(
     state: TaxonomyState,
     proposal_groups: Sequence[ProposalGroup],
-    result: ReconciliationOutput | FinalReconciliationOutput,
-    *,
-    min_create_support: int,
-    allow_defer: bool,
-    max_total_labels: int,
+    result: ProposalScreeningOutput,
 ) -> None:
-    expected_group_ids = {group.group_id for group in proposal_groups}
+    expected_ids = {group.group_id for group in proposal_groups}
+    returned_ids = [decision.proposal_group_id for decision in result.decisions]
 
-    seen_group_ids = [
-        group_id
-        for resolution in result.proposal_resolutions
-        for group_id in resolution.proposal_group_ids
-    ]
+    if len(returned_ids) != len(set(returned_ids)):
+        raise ValueError("Proposal screener returned a proposal group more than once")
 
-    # Defensive check. The Pydantic output model should already catch this,
-    # but retaining it here is appropriate for a fail-fast research pipeline.
-    if len(seen_group_ids) != len(set(seen_group_ids)):
-        raise ValueError("Reconciler resolved a proposal group more than once")
-
-    seen_group_id_set = set(seen_group_ids)
-
-    if seen_group_id_set != expected_group_ids:
-        missing = expected_group_ids - seen_group_id_set
-        unknown = seen_group_id_set - expected_group_ids
-
+    returned_id_set = set(returned_ids)
+    if returned_id_set != expected_ids:
         raise ValueError(
-            "Reconciler proposal coverage mismatch; "
-            f"missing={sorted(missing)}, "
-            f"unknown={sorted(unknown)}"
+            "Proposal screening coverage mismatch; "
+            f"missing={sorted(expected_ids - returned_id_set)}, "
+            f"unknown={sorted(returned_id_set - expected_ids)}"
         )
 
-    group_by_id = {group.group_id: group for group in proposal_groups}
-
-    active = active_labels(state)
-    active_ids = {label.id for label in active}
-    dynamic_ids = {label.id for label in state.dynamic_labels}
-
-    # Work this out before validating proposal resolutions, because
-    # map_existing must not target a label that disappears in this same
-    # reconciliation.
-    merge_sources = {
-        change.source_label_id
-        for change in result.dynamic_label_changes
-        if change.action == "merge"
-    }
-
-    # ------------------------------------------------------------------
-    # Proposal resolutions
-    # ------------------------------------------------------------------
-
-    num_creates = 0
-
-    for resolution in result.proposal_resolutions:
-
-        if resolution.action == "defer":
-            if not allow_defer:
+    active_ids = {label.id for label in active_labels(state)}
+    for decision in result.decisions:
+        if decision.action == "map_existing":
+            if decision.target_label_id not in active_ids:
                 raise ValueError(
-                    "Reconciler deferred a proposal during final maintenance"
+                    "Proposal screener mapped to unknown active label "
+                    f"{decision.target_label_id!r}"
                 )
-
-            # This is already structurally enforced by DeferResolution,
-            # but keep the semantic assertion as defense in depth.
-            if len(resolution.proposal_group_ids) != 1:
-                raise ValueError(
-                    "A defer resolution must contain exactly one proposal "
-                    "group so candidate evidence remains attributable"
-                )
-
-        elif resolution.action == "reject":
-            # Nothing additional to validate against taxonomy state.
-            pass
-
-        elif resolution.action == "map_existing":
-            target_id = resolution.target_label_id
-
-            if target_id not in active_ids:
-                raise ValueError(f"Reconciler mapped to unknown label {target_id}")
-
-            if target_id in merge_sources:
-                raise ValueError(
-                    f"Proposal mapped to {target_id}, but that label is "
-                    "merged away in the same reconciliation"
-                )
-
-        elif resolution.action == "create":
-            support = sum(
-                group_by_id[group_id].support_count
-                for group_id in resolution.proposal_group_ids
-            )
-
-            if support < min_create_support:
-                raise ValueError(
-                    f"Create action has support {support}, below minimum "
-                    f"{min_create_support}"
-                )
-
-            num_creates += 1
-
-        else:
-            # In principle unreachable because of the Pydantic schema.
-            raise ValueError(
-                f"Unknown proposal resolution action: " f"{resolution.action!r}"
-            )
-
-    # ------------------------------------------------------------------
-    # Dynamic-label changes
-    # ------------------------------------------------------------------
-
-    num_merges = 0
-
-    for change in result.dynamic_label_changes:
-
-        if change.source_label_id not in dynamic_ids:
-            raise ValueError(
-                "Reconciler attempted to modify non-dynamic label "
-                f"{change.source_label_id}"
-            )
-
-        if change.action == "merge":
-            target_id = change.target_label_id
-
-            if target_id not in active_ids:
-                raise ValueError(f"Merge target {target_id} is not an active label")
-
-            if target_id in merge_sources:
-                raise ValueError(
-                    "Merge chains within one reconciliation are forbidden; "
-                    f"target {target_id} is also a merge source"
-                )
-
-            num_merges += 1
-
-        elif change.action == "revise":
-            # name and definition are structurally required by
-            # ReviseDynamicLabel, so there is no additional state-dependent
-            # validation needed here.
-            pass
-
-        else:
-            raise ValueError(f"Unknown dynamic-label action: {change.action!r}")
-
-    # ------------------------------------------------------------------
-    # Resulting taxonomy size
-    # ------------------------------------------------------------------
-
-    resulting_active_count = len(active) - num_merges + num_creates
-
-    if resulting_active_count > max_total_labels:
-        raise ValueError(
-            "Reconciliation exceeds taxonomy-size limit: "
-            f"{len(active)} current "
-            f"- {num_merges} merges "
-            f"+ {num_creates} creations "
-            f"= {resulting_active_count}, "
-            f"maximum is {max_total_labels}"
-        )
+        elif decision.action not in {"keep_candidate", "discard_candidate"}:
+            raise ValueError(f"Unknown screening action {decision.action!r}")
 
 
-def apply_reconciliation(
+def apply_proposal_screening(
     state: TaxonomyState,
     proposal_groups: Sequence[ProposalGroup],
-    result: ReconciliationOutput | FinalReconciliationOutput,
+    result: ProposalScreeningOutput,
     *,
     discovery_seq_end: int,
     max_total_labels: int,
-    min_create_support: int,
-    maintenance_kind: str,
 ) -> TaxonomyState:
-    validate_reconciliation_semantics(
+    """Apply screening without changing the active taxonomy version."""
+
+    validate_proposal_screening_semantics(state, proposal_groups, result)
+    group_by_id = {group.group_id: group for group in proposal_groups}
+    candidate_by_id = {group.group_id: group for group in state.candidate_proposals}
+
+    if len(candidate_by_id) != len(state.candidate_proposals):
+        raise ValueError("Taxonomy state contains duplicate candidate proposal groups")
+
+    for decision in result.decisions:
+        group_id = decision.proposal_group_id
+
+        if decision.action == "keep_candidate":
+            incoming = group_by_id[group_id]
+            existing = candidate_by_id.get(group_id)
+            if existing is not None:
+                # Re-screening an existing candidate is allowed, but the evidence
+                # object itself must be unchanged by the model boundary.
+                if existing != incoming:
+                    raise ValueError(
+                        f"Candidate {group_id!r} changed unexpectedly during re-screening"
+                    )
+            else:
+                candidate_by_id[group_id] = incoming
+
+        elif decision.action in {"map_existing", "discard_candidate"}:
+            # This also handles a re-screened existing candidate that has become
+            # covered by a newly created active label.
+            candidate_by_id.pop(group_id, None)
+
+        else:  # pragma: no cover - discriminated Pydantic schema prevents this.
+            raise ValueError(f"Unknown screening action {decision.action!r}")
+
+    now = int(time.time())
+    history_entry = ProposalScreeningHistoryEntry(
+        timestamp_unix=now,
+        discovery_seq_end=discovery_seq_end,
+        taxonomy_version=state.schema_version,
+        proposal_groups=list(proposal_groups),
+        screening=result,
+    )
+
+    candidate = state.model_copy(
+        update={
+            "candidate_proposals": list(candidate_by_id.values()),
+            "last_screened_discovery_seq": discovery_seq_end,
+            "history": [*state.history, history_entry],
+            "updated_at_unix": now,
+        }
+    )
+    validate_taxonomy_state(candidate, max_total_labels=max_total_labels)
+    return candidate
+
+
+def screen_new_proposals(
+    *,
+    model: ModelClient,
+    state: TaxonomyState,
+    aspect: str,
+    discovery_output: Path,
+    taxonomy_path: Path,
+    max_total_labels: int,
+    max_screening_groups: int,
+    maintenance_max_tokens: int,
+) -> TaxonomyState:
+    latest_seq, usage, new_groups = scan_discovery_results(
+        discovery_output,
         state,
-        proposal_groups,
+        after_seq=state.last_screened_discovery_seq,
+    )
+    state = update_usage_counts(state, usage)
+    state, groups_to_screen = accumulate_existing_candidate_support(state, new_groups)
+
+    if not groups_to_screen:
+        state = state.model_copy(
+            update={
+                "last_screened_discovery_seq": latest_seq,
+                "updated_at_unix": int(time.time()),
+            }
+        )
+        validate_taxonomy_state(state, max_total_labels=max_total_labels)
+        atomic_write_model(taxonomy_path, state)
+        return state
+
+    # ``max_screening_groups`` is a per-model-call bound, not a cap on the
+    # number of novel groups that may occur in one discovery interval. Process
+    # all groups in deterministic chunks, but persist only after every chunk
+    # succeeds. This keeps the screening cursor transactional: if any model call
+    # fails, the on-disk state still points to the old suffix and the whole
+    # interval is safely reprocessed on resume without double-counting support.
+    for group_batch in batch_iter(groups_to_screen, max_screening_groups):
+        result = model.screen_proposals(
+            state, group_batch, max_tokens=maintenance_max_tokens, aspect=aspect
+        )
+        state = apply_proposal_screening(
+            state,
+            group_batch,
+            result,
+            discovery_seq_end=latest_seq,
+            max_total_labels=max_total_labels,
+        )
+
+    atomic_write_model(taxonomy_path, state)
+    return state
+
+
+def validate_candidate_promotion_semantics(
+    state: TaxonomyState,
+    candidate_groups: Sequence[ProposalGroup],
+    result: CandidatePromotionOutput,
+    *,
+    min_promotion_support: int,
+    max_new_labels: int,
+    max_total_labels: int,
+) -> None:
+    expected_ids = {group.group_id for group in candidate_groups}
+    returned_ids = [
+        group_id
+        for new_label in result.new_labels
+        for group_id in new_label.candidate_group_ids
+    ]
+
+    if len(returned_ids) != len(set(returned_ids)):
+        raise ValueError("Candidate promoter used a candidate group more than once")
+
+    returned_id_set = set(returned_ids)
+    if returned_id_set != expected_ids:
+        raise ValueError(
+            "Candidate promotion coverage mismatch; "
+            f"missing={sorted(expected_ids - returned_id_set)}, "
+            f"unknown={sorted(returned_id_set - expected_ids)}"
+        )
+
+    if len(result.new_labels) > max_new_labels:
+        raise ValueError(
+            f"Candidate promoter created {len(result.new_labels)} labels, exceeding "
+            f"the task limit {max_new_labels}"
+        )
+
+    new_names = [normalize_text(label.name) for label in result.new_labels]
+    if len(new_names) != len(set(new_names)):
+        raise ValueError("Candidate promoter produced duplicate new-label names")
+
+    active_names = {normalize_text(label.name) for label in active_labels(state)}
+    overlapping_names = sorted(set(new_names) & active_names)
+    if overlapping_names:
+        raise ValueError(
+            "Candidate promoter produced a label name already present in the active "
+            f"taxonomy: {overlapping_names}"
+        )
+
+    state_candidates = {group.group_id: group for group in state.candidate_proposals}
+    if len(state_candidates) != len(state.candidate_proposals):
+        raise ValueError("Taxonomy state contains duplicate candidate proposal groups")
+
+    for group in candidate_groups:
+        persisted = state_candidates.get(group.group_id)
+        if persisted is None:
+            raise ValueError(
+                f"Promotion candidate {group.group_id!r} is absent from taxonomy state"
+            )
+        if persisted != group:
+            raise ValueError(
+                f"Promotion candidate {group.group_id!r} does not match persisted evidence"
+            )
+        if group.support_count < min_promotion_support:
+            raise ValueError(
+                f"Promotion candidate {group.group_id!r} has support "
+                f"{group.support_count}, below minimum {min_promotion_support}"
+            )
+
+    resulting_count = len(active_labels(state)) + len(result.new_labels)
+    if resulting_count > max_total_labels:
+        raise ValueError(
+            f"Candidate promotion would create {resulting_count} active labels, "
+            f"exceeding maximum {max_total_labels}"
+        )
+
+
+def apply_candidate_promotion(
+    state: TaxonomyState,
+    candidate_groups: Sequence[ProposalGroup],
+    result: CandidatePromotionOutput,
+    *,
+    discovery_seq_end: int,
+    min_promotion_support: int,
+    max_new_labels: int,
+    max_total_labels: int,
+) -> TaxonomyState:
+    validate_candidate_promotion_semantics(
+        state,
+        candidate_groups,
         result,
-        min_create_support=min_create_support,
-        allow_defer=(maintenance_kind != "final"),
+        min_promotion_support=min_promotion_support,
+        max_new_labels=max_new_labels,
         max_total_labels=max_total_labels,
     )
 
     before_version = state.schema_version
-    taxonomy_changes_requested = bool(result.dynamic_label_changes) or any(
-        resolution.action == "create" for resolution in result.proposal_resolutions
-    )
-    after_version = before_version + 1 if taxonomy_changes_requested else before_version
+    after_version = before_version + 1
+    group_by_id = {group.group_id: group for group in candidate_groups}
+    promoted_group_ids = {
+        group_id
+        for new_label in result.new_labels
+        for group_id in new_label.candidate_group_ids
+    }
 
+    dynamic_by_id = {label.id: label for label in state.dynamic_labels}
+    state_for_id_allocation = state.model_copy(
+        update={"dynamic_labels": list(dynamic_by_id.values())}
+    )
+    created_labels: list[DynamicLabelDef] = []
+
+    for promoted in result.new_labels:
+        support = sum(
+            group_by_id[group_id].support_count
+            for group_id in promoted.candidate_group_ids
+        )
+        new_id = next_dynamic_id(state_for_id_allocation)
+        created = DynamicLabelDef(
+            id=new_id,
+            name=promoted.name,
+            definition=promoted.definition,
+            created_version=after_version,
+            last_modified_version=after_version,
+            usage_count=0,
+            proposal_support_count=support,
+        )
+        dynamic_by_id[new_id] = created
+        state_for_id_allocation.dynamic_labels.append(created)
+        created_labels.append(created)
+
+    remaining_candidates = [
+        group
+        for group in state.candidate_proposals
+        if group.group_id not in promoted_group_ids
+    ]
+
+    now = int(time.time())
+    candidate = state.model_copy(
+        update={
+            "schema_version": after_version,
+            "dynamic_labels": list(dynamic_by_id.values()),
+            "candidate_proposals": remaining_candidates,
+            "next_dynamic_label_num": state_for_id_allocation.next_dynamic_label_num,
+            "updated_at_unix": now,
+        }
+    )
+
+    validate_unique_labels(active_labels(candidate), context="promoted taxonomy")
+    if len(active_labels(candidate)) > max_total_labels:
+        raise ValueError(
+            f"Promotion produced {len(active_labels(candidate))} active labels, "
+            f"exceeding cap {max_total_labels}"
+        )
+
+    history_entry = CandidatePromotionHistoryEntry(
+        timestamp_unix=now,
+        discovery_seq_end=discovery_seq_end,
+        version_before=before_version,
+        version_after=after_version,
+        candidate_groups=list(candidate_groups),
+        promotion=result,
+        created_labels=created_labels,
+    )
+    candidate = candidate.model_copy(
+        update={"history": [*candidate.history, history_entry]}
+    )
+    validate_taxonomy_state(candidate, max_total_labels=max_total_labels)
+    return candidate
+
+
+def promote_eligible_candidates(
+    *,
+    model: ModelClient,
+    state: TaxonomyState,
+    aspect: str,
+    taxonomy_path: Path,
+    min_promotion_support: int,
+    max_promotion_groups: int,
+    max_total_labels: int,
+    maintenance_max_tokens: int,
+    persist: bool = True,
+) -> TaxonomyState:
+    """Promote supported candidates in bounded batches.
+
+    Before each promotion batch, the selected candidates are screened again against
+    the *current* taxonomy. This matters because a candidate kept at taxonomy v2 may
+    become adequately covered by a label created at v3.
+
+    The selected batch never contains more candidate groups than available label
+    slots. Therefore the promoter can always keep every candidate distinct if needed;
+    it is never forced to merge unrelated concepts merely to satisfy the taxonomy cap.
+    """
+
+    while True:
+        available_slots = max_total_labels - len(active_labels(state))
+        if available_slots <= 0:
+            return state
+
+        eligible = sorted(
+            (
+                group
+                for group in state.candidate_proposals
+                if group.support_count >= min_promotion_support
+            ),
+            key=lambda group: (-group.support_count, group.group_id),
+        )
+        if not eligible:
+            return state
+
+        batch_size = min(max_promotion_groups, available_slots, len(eligible))
+        selected = eligible[:batch_size]
+
+        # Re-screen against the current taxonomy immediately before promotion.
+        screening = model.screen_proposals(
+            state, selected, max_tokens=maintenance_max_tokens, aspect=aspect
+        )
+        state = apply_proposal_screening(
+            state,
+            selected,
+            screening,
+            discovery_seq_end=state.last_screened_discovery_seq,
+            max_total_labels=max_total_labels,
+        )
+        if persist:
+            atomic_write_model(taxonomy_path, state)
+
+        kept_ids = {
+            decision.proposal_group_id
+            for decision in screening.decisions
+            if decision.action == "keep_candidate"
+        }
+        if not kept_ids:
+            # All selected candidates were mapped/discarded, which is still
+            # deterministic progress because they were removed from the pool.
+            continue
+
+        candidate_by_id = {group.group_id: group for group in state.candidate_proposals}
+        to_promote = [
+            candidate_by_id[group.group_id]
+            for group in selected
+            if group.group_id in kept_ids
+        ]
+
+        max_new_labels = len(to_promote)
+        promotion = model.promote_candidates(
+            state,
+            to_promote,
+            aspect=aspect,
+            max_new_labels=max_new_labels,
+            max_tokens=maintenance_max_tokens,
+        )
+        state = apply_candidate_promotion(
+            state,
+            to_promote,
+            promotion,
+            discovery_seq_end=state.last_screened_discovery_seq,
+            min_promotion_support=min_promotion_support,
+            max_new_labels=max_new_labels,
+            max_total_labels=max_total_labels,
+        )
+        if persist:
+            atomic_write_model(taxonomy_path, state)
+
+
+def run_periodic_maintenance(
+    *,
+    model: ModelClient,
+    state: TaxonomyState,
+    aspect: str,
+    discovery_output: Path,
+    taxonomy_path: Path,
+    max_total_labels: int,
+    min_promotion_support: int,
+    max_screening_groups: int,
+    max_promotion_groups: int,
+    maintenance_max_tokens: int,
+) -> TaxonomyState:
+    state = screen_new_proposals(
+        model=model,
+        state=state,
+        aspect=aspect,
+        discovery_output=discovery_output,
+        taxonomy_path=taxonomy_path,
+        max_total_labels=max_total_labels,
+        max_screening_groups=max_screening_groups,
+        maintenance_max_tokens=maintenance_max_tokens,
+    )
+    state = promote_eligible_candidates(
+        model=model,
+        state=state,
+        aspect=aspect,
+        taxonomy_path=taxonomy_path,
+        min_promotion_support=min_promotion_support,
+        max_promotion_groups=max_promotion_groups,
+        max_total_labels=max_total_labels,
+        maintenance_max_tokens=maintenance_max_tokens,
+    )
+    return state
+
+
+def validate_final_merge_semantics(
+    state: TaxonomyState,
+    result: FinalMergeOutput,
+) -> None:
+    active_ids = {label.id for label in active_labels(state)}
+    dynamic_ids = {label.id for label in state.dynamic_labels}
+    sources = [merge.source_label_id for merge in result.merges]
+
+    if len(sources) != len(set(sources)):
+        raise ValueError("Final merge pass returned a dynamic source more than once")
+
+    source_set = set(sources)
+    for merge in result.merges:
+        if merge.source_label_id not in dynamic_ids:
+            raise ValueError(
+                f"Final merge source {merge.source_label_id!r} is not a dynamic label"
+            )
+        if merge.target_label_id not in active_ids:
+            raise ValueError(
+                f"Final merge target {merge.target_label_id!r} is not active"
+            )
+        if merge.source_label_id == merge.target_label_id:
+            raise ValueError("A label cannot be merged into itself")
+        if merge.target_label_id in source_set:
+            raise ValueError(
+                "Final merge chains are forbidden; target "
+                f"{merge.target_label_id!r} is also a merge source"
+            )
+
+
+def apply_final_merge(
+    state: TaxonomyState,
+    result: FinalMergeOutput,
+    *,
+    max_total_labels: int,
+) -> TaxonomyState:
+    validate_final_merge_semantics(state, result)
+
+    before_version = state.schema_version
+    after_version = before_version + 1 if result.merges else before_version
     dynamic_by_id = {label.id: label for label in state.dynamic_labels}
     alias_map = dict(state.alias_map)
 
-    for change in result.dynamic_label_changes:
-        if change.action != "merge":
-            continue
-        source = dynamic_by_id.pop(change.source_label_id)
-        assert change.target_label_id is not None
-        target_id = resolve_alias(change.target_label_id, alias_map)
+    for merge in result.merges:
+        source = dynamic_by_id.pop(merge.source_label_id)
+        target_id = resolve_alias(merge.target_label_id, alias_map)
 
         if target_id in dynamic_by_id:
             target = dynamic_by_id[target_id]
@@ -390,90 +722,22 @@ def apply_reconciliation(
             if old_target == source.id:
                 alias_map[old_source] = target_id
 
-    for change in result.dynamic_label_changes:
-        if change.action != "revise":
-            continue
-        label = dynamic_by_id[change.source_label_id]
-        dynamic_by_id[label.id] = label.model_copy(
-            update={
-                "name": change.name if change.name is not None else label.name,
-                "definition": (
-                    change.definition
-                    if change.definition is not None
-                    else label.definition
-                ),
-                "last_modified_version": after_version,
-            }
-        )
-
-    group_by_id = {group.group_id: group for group in proposal_groups}
-    created_labels: list[DynamicLabelDef] = []
-
-    state_for_id_allocation = state.model_copy(
-        update={
-            "dynamic_labels": list(dynamic_by_id.values()),
-            "alias_map": alias_map,
-        }
-    )
-    for resolution in result.proposal_resolutions:
-        if resolution.action != "create":
-            continue
-        assert resolution.name is not None
-        assert resolution.definition is not None
-        support = sum(
-            group_by_id[group_id].support_count
-            for group_id in resolution.proposal_group_ids
-        )
-        new_id = next_dynamic_id(state_for_id_allocation)
-        created = DynamicLabelDef(
-            id=new_id,
-            name=resolution.name,
-            definition=resolution.definition,
-            created_version=after_version,
-            last_modified_version=after_version,
-            usage_count=0,
-            proposal_support_count=support,
-        )
-        dynamic_by_id[new_id] = created
-        state_for_id_allocation.dynamic_labels.append(created)
-        created_labels.append(created)
-
-    deferred_by_id: dict[str, ProposalGroup] = {}
-    for resolution in result.proposal_resolutions:
-        if resolution.action != "defer":
-            continue
-        group_id = resolution.proposal_group_ids[0]
-        deferred_by_id[group_id] = group_by_id[group_id]
-
-    dynamic_labels = list(dynamic_by_id.values())
+    now = int(time.time())
     candidate = state.model_copy(
         update={
             "schema_version": after_version,
-            "dynamic_labels": dynamic_labels,
+            "dynamic_labels": list(dynamic_by_id.values()),
             "alias_map": alias_map,
-            "deferred_proposals": list(deferred_by_id.values()),
-            "next_dynamic_label_num": state_for_id_allocation.next_dynamic_label_num,
-            "last_reconciled_discovery_seq": discovery_seq_end,
-            "updated_at_unix": int(time.time()),
+            "updated_at_unix": now,
         }
     )
+    validate_unique_labels(active_labels(candidate), context="post-merge taxonomy")
 
-    validate_unique_labels(active_labels(candidate), context="reconciled taxonomy")
-    if len(active_labels(candidate)) > max_total_labels:
-        raise ValueError(
-            f"Reconciliation would produce {len(active_labels(candidate))} active "
-            f"labels, exceeding cap {max_total_labels}"
-        )
-
-    history_entry = SchemaHistoryEntry(
-        timestamp_unix=int(time.time()),
-        maintenance_kind=maintenance_kind,
-        discovery_seq_end=discovery_seq_end,
+    history_entry = FinalMergeHistoryEntry(
+        timestamp_unix=now,
         version_before=before_version,
         version_after=after_version,
-        proposal_groups=list(proposal_groups),
-        reconciliation=result,
-        created_labels=created_labels,
+        result=result,
     )
     candidate = candidate.model_copy(
         update={"history": [*candidate.history, history_entry]}
@@ -482,82 +746,171 @@ def apply_reconciliation(
     return candidate
 
 
-def reconcile_pending(
+def validate_final_revision_semantics(
+    state: TaxonomyState,
+    result: FinalRevisionOutput,
+) -> None:
+    dynamic_ids = {label.id for label in state.dynamic_labels}
+    returned_ids = [revision.label_id for revision in result.revisions]
+
+    if len(returned_ids) != len(set(returned_ids)):
+        raise ValueError("Final revision pass returned a dynamic label more than once")
+
+    unknown = set(returned_ids) - dynamic_ids
+    if unknown:
+        raise ValueError(
+            f"Final revision pass referenced non-dynamic labels {sorted(unknown)}"
+        )
+
+    revisions_by_id = {revision.label_id: revision for revision in result.revisions}
+    for label in state.dynamic_labels:
+        revision = revisions_by_id.get(label.id)
+        if revision is not None and (
+            revision.name == label.name and revision.definition == label.definition
+        ):
+            raise ValueError(
+                f"Final revision for {label.id!r} is a no-op; unchanged labels must "
+                "be omitted from revisions"
+            )
+
+    resulting_names = [normalize_text(label.name) for label in state.seed_labels]
+    resulting_names.extend(
+        (
+            normalize_text(revisions_by_id[label.id].name)
+            if label.id in revisions_by_id
+            else normalize_text(label.name)
+        )
+        for label in state.dynamic_labels
+    )
+    if len(resulting_names) != len(set(resulting_names)):
+        raise ValueError("Final revisions would create duplicate active label names")
+
+
+def apply_final_revision(
+    state: TaxonomyState,
+    result: FinalRevisionOutput,
+    *,
+    max_total_labels: int,
+) -> TaxonomyState:
+    validate_final_revision_semantics(state, result)
+
+    before_version = state.schema_version
+    after_version = before_version + 1 if result.revisions else before_version
+    dynamic_by_id = {label.id: label for label in state.dynamic_labels}
+
+    for revision in result.revisions:
+        label = dynamic_by_id[revision.label_id]
+        dynamic_by_id[label.id] = label.model_copy(
+            update={
+                "name": revision.name,
+                "definition": revision.definition,
+                "last_modified_version": after_version,
+            }
+        )
+
+    now = int(time.time())
+    candidate = state.model_copy(
+        update={
+            "schema_version": after_version,
+            "dynamic_labels": list(dynamic_by_id.values()),
+            "updated_at_unix": now,
+        }
+    )
+    validate_unique_labels(active_labels(candidate), context="post-revision taxonomy")
+
+    history_entry = FinalRevisionHistoryEntry(
+        timestamp_unix=now,
+        version_before=before_version,
+        version_after=after_version,
+        result=result,
+    )
+    candidate = candidate.model_copy(
+        update={"history": [*candidate.history, history_entry]}
+    )
+    validate_taxonomy_state(candidate, max_total_labels=max_total_labels)
+    return candidate
+
+
+def run_final_maintenance(
     *,
     model: ModelClient,
     state: TaxonomyState,
-    discovery_output: Path,
+    aspect: str,
     taxonomy_path: Path,
     max_total_labels: int,
-    min_create_support: int,
-    max_reconcile_groups: int,
-    reconcile_max_tokens: int,
-    final_maintenance: bool,
+    min_promotion_support: int,
+    max_promotion_groups: int,
+    max_revision_labels: int,
+    maintenance_max_tokens: int,
 ) -> TaxonomyState:
-    latest_seq, usage, new_proposal_groups = scan_discovery_results(
-        discovery_output,
-        state,
-        after_seq=state.last_reconciled_discovery_seq,
-    )
-    state = update_usage_counts(state, usage)
+    """Finish taxonomy construction with isolated merge/revision tasks.
 
-    proposal_groups = combine_proposal_groups(
-        state.deferred_proposals,
-        new_proposal_groups,
-    )
+    A merge can free taxonomy slots. Therefore final maintenance alternates a
+    merge pass with deterministic promotion of any still-supported candidates.
+    If promotion creates labels, another merge pass is run so newly created
+    labels also receive final redundancy review. The loop stops as soon as a
+    merge pass is followed by no promotion. Revision then runs exactly once on
+    the surviving dynamic labels.
 
-    if len(proposal_groups) > max_reconcile_groups:
-        raise ValueError(
-            f"Found {len(proposal_groups)} candidate proposal groups, exceeding "
-            f"--max-reconcile-groups={max_reconcile_groups}. Increase that limit "
-            "or reconcile more frequently so the candidate pool stays manageable."
+    This function intentionally does not persist intermediate final-maintenance
+    states. The caller atomically writes the taxonomy only after setting the
+    frozen metadata, so a crash cannot leave a half-finalized state that would
+    receive a second final pass on resume.
+    """
+
+    while True:
+        merge_result = model.final_merge_pass(
+            state,
+            aspect=aspect,
+            max_tokens=maintenance_max_tokens,
+        )
+        state = apply_final_merge(
+            state,
+            merge_result,
+            max_total_labels=max_total_labels,
         )
 
-    if not new_proposal_groups and not final_maintenance:
-        state = state.model_copy(
-            update={
-                "last_reconciled_discovery_seq": latest_seq,
-                "updated_at_unix": int(time.time()),
-            }
+        version_before_promotion = state.schema_version
+        state = promote_eligible_candidates(
+            model=model,
+            state=state,
+            aspect=aspect,
+            taxonomy_path=taxonomy_path,
+            min_promotion_support=min_promotion_support,
+            max_promotion_groups=max_promotion_groups,
+            max_total_labels=max_total_labels,
+            maintenance_max_tokens=maintenance_max_tokens,
+            persist=False,
         )
-        validate_taxonomy_state(state, max_total_labels=max_total_labels)
-        atomic_write_model(taxonomy_path, state)
-        return state
 
-    if final_maintenance and not proposal_groups and not state.dynamic_labels:
-        state = state.model_copy(
-            update={
-                "last_reconciled_discovery_seq": latest_seq,
-                "updated_at_unix": int(time.time()),
-            }
+        if state.schema_version == version_before_promotion:
+            break
+
+    if max_revision_labels < 1:
+        raise ValueError("max_revision_labels must be >= 1")
+
+    # Revision output includes complete names and definitions, so bound the number
+    # of labels reviewed per call. Every call still sees the complete surviving
+    # taxonomy for global name/style consistency.
+    revision_ids = [label.id for label in state.dynamic_labels]
+    for review_batch in batch_iter(revision_ids, max_revision_labels):
+        revision_result = model.final_revision_pass(
+            state,
+            review_batch,
+            aspect=aspect,
+            max_tokens=maintenance_max_tokens,
         )
-        validate_taxonomy_state(state, max_total_labels=max_total_labels)
-        atomic_write_model(taxonomy_path, state)
-        return state
-
-    result = model.reconcile(
-        state,
-        proposal_groups,
-        max_total_labels=max_total_labels,
-        min_create_support=min_create_support,
-        max_tokens=reconcile_max_tokens,
-        final_maintenance=final_maintenance,
-    )
-    state = apply_reconciliation(
-        state,
-        proposal_groups,
-        result,
-        discovery_seq_end=latest_seq,
-        max_total_labels=max_total_labels,
-        min_create_support=min_create_support,
-        maintenance_kind="final" if final_maintenance else "periodic",
-    )
-    atomic_write_model(taxonomy_path, state)
+        state = apply_final_revision(
+            state,
+            revision_result,
+            max_total_labels=max_total_labels,
+        )
     return state
 
 
 def build_discovery_settings(
-    args: argparse.Namespace, input_path: Path
+    args: argparse.Namespace,
+    input_path: Path,
 ) -> DiscoverySettings:
     resolved, size, mtime_ns = file_fingerprint(input_path)
     return DiscoverySettings(
@@ -570,18 +923,22 @@ def build_discovery_settings(
         max_model_len=args.max_model_len,
         max_document_tokens=args.max_document_tokens,
         classification_max_tokens=args.classification_max_tokens,
-        reconcile_max_tokens=args.reconcile_max_tokens,
+        max_assigned_labels_per_doc=args.max_assigned_labels_per_doc,
+        maintenance_max_tokens=args.maintenance_max_tokens,
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         dtype=args.dtype,
         seed=args.seed,
         thinking_mode=args.thinking_mode,
-        reconcile_every=args.reconcile_every,
-        max_reconcile_groups=args.max_reconcile_groups,
-        min_create_support=args.min_create_support,
+        screen_every=args.screen_every,
+        max_screening_groups=args.max_screening_groups,
+        max_promotion_groups=args.max_promotion_groups,
+        max_revision_labels=args.max_revision_labels,
+        min_promotion_support=args.min_promotion_support,
         max_proposals_per_doc=args.max_proposals_per_doc,
         max_total_labels=args.max_total_labels,
         expected_seed_label_count=args.expected_seed_label_count,
+        creativity=args.creativity,
     )
 
 
@@ -593,6 +950,7 @@ def initialize_or_load_taxonomy(
     settings: DiscoverySettings,
 ) -> TaxonomyState:
     seed_hash = seed_labels_hash(seed_labels)
+
     if taxonomy_path.exists():
         state = load_model_file(taxonomy_path, TaxonomyState)
         validate_taxonomy_state(
@@ -621,6 +979,7 @@ def initialize_or_load_taxonomy(
 
     now = int(time.time())
     state = TaxonomyState(
+        format_version=3,
         aspect=aspect,
         schema_version=1,
         frozen=False,
@@ -628,9 +987,9 @@ def initialize_or_load_taxonomy(
         seed_labels=list(seed_labels),
         dynamic_labels=[],
         alias_map={},
-        deferred_proposals=[],
+        candidate_proposals=[],
         next_dynamic_label_num=25,
-        last_reconciled_discovery_seq=0,
+        last_screened_discovery_seq=0,
         discovery_settings=settings,
         history=[],
         created_at_unix=now,
@@ -676,10 +1035,10 @@ def run_discovery(args: argparse.Namespace) -> None:
     )
 
     if not discovery_output.exists() and (
-        state.last_reconciled_discovery_seq != 0
+        state.last_screened_discovery_seq != 0
         or state.schema_version != 1
         or state.dynamic_labels
-        or state.deferred_proposals
+        or state.candidate_proposals
         or state.history
     ):
         raise ValueError(
@@ -687,15 +1046,17 @@ def run_discovery(args: argparse.Namespace) -> None:
         )
 
     completed_ids, last_seq = load_result_index(discovery_output, DiscoveryRecord)
-    if last_seq < state.last_reconciled_discovery_seq:
+    if last_seq < state.last_screened_discovery_seq:
         raise ValueError(
-            "Taxonomy reconciliation cursor is ahead of persisted discovery output"
+            "Taxonomy screening cursor is ahead of persisted discovery output"
         )
 
     LOGGER.info(
-        "Discovery resume state: %d completed documents, taxonomy version %d",
+        "Discovery resume state: %d completed documents, taxonomy version %d, "
+        "%d kept candidates",
         len(completed_ids),
         state.schema_version,
+        len(state.candidate_proposals),
     )
 
     model = ModelClient(
@@ -711,13 +1072,19 @@ def run_discovery(args: argparse.Namespace) -> None:
     seen_input_ids: set[str] = set()
     next_seq = last_seq + 1
     processed_this_run = 0
-    total_input = sum(1 for _ in stream_documents(input_path))
+    total_input = count_jsonl_records(input_path)
+    if len(completed_ids) > total_input:
+        raise ValueError(
+            f"Discovery output contains {len(completed_ids)} records but input "
+            f"contains only {total_input} documents"
+        )
+    total_pending = total_input - len(completed_ids)
 
-    # Optionally start compute logger
     stop_event = None
-    if getattr(args, "compute_logging", False):
+    if getattr(args, "compute_logging", False) and total_pending > 0:
+
         def _get_progress() -> tuple[int, int]:
-            return processed_this_run, total_input
+            return processed_this_run, total_pending
 
         stop_event = start_compute_logger(
             interval=getattr(args, "compute_logging_interval", 300.0),
@@ -742,6 +1109,7 @@ def run_discovery(args: argparse.Namespace) -> None:
                 batch,
                 labels_snapshot,
                 aspect=state.aspect,
+                creativity=args.creativity,
                 max_document_tokens=args.max_document_tokens,
                 output_max_tokens=args.classification_max_tokens,
                 max_assigned_labels_per_doc=args.max_assigned_labels_per_doc,
@@ -785,28 +1153,30 @@ def run_discovery(args: argparse.Namespace) -> None:
             last_seq = records[-1].seq
 
             LOGGER.info(
-                "Discovery: persisted %d documents this run; latest seq=%d; taxonomy v%d",
+                "Discovery: processed %d documents this run; latest seq=%d; taxonomy v%d",
                 processed_this_run,
                 last_seq,
                 state.schema_version,
             )
 
-            if last_seq - state.last_reconciled_discovery_seq >= args.reconcile_every:
-                state = reconcile_pending(
+            if last_seq - state.last_screened_discovery_seq >= args.screen_every:
+                state = run_periodic_maintenance(
                     model=model,
                     state=state,
+                    aspect=state.aspect,
                     discovery_output=discovery_output,
                     taxonomy_path=taxonomy_path,
                     max_total_labels=args.max_total_labels,
-                    min_create_support=args.min_create_support,
-                    max_reconcile_groups=args.max_reconcile_groups,
-                    reconcile_max_tokens=args.reconcile_max_tokens,
-                    final_maintenance=False,
+                    min_promotion_support=args.min_promotion_support,
+                    max_screening_groups=args.max_screening_groups,
+                    max_promotion_groups=args.max_promotion_groups,
+                    maintenance_max_tokens=args.maintenance_max_tokens,
                 )
                 LOGGER.info(
-                    "Reconciled taxonomy: version=%d active_labels=%d",
+                    "Maintenance complete: taxonomy v%d, %d active labels, %d kept candidates",
                     state.schema_version,
                     len(active_labels(state)),
+                    len(state.candidate_proposals),
                 )
 
     finally:
@@ -816,30 +1186,65 @@ def run_discovery(args: argparse.Namespace) -> None:
     if total_input == 0:
         raise ValueError("Input corpus contains no documents")
 
-    state = reconcile_pending(
+    missing_completed = completed_ids - seen_input_ids
+    if missing_completed:
+        raise ValueError(
+            "Discovery output contains document IDs absent from the input corpus: "
+            f"{sorted(missing_completed)[:10]}"
+        )
+
+    # Screen the final suffix and promote every supported candidate for which the
+    # taxonomy cap leaves room.
+    state = run_periodic_maintenance(
         model=model,
         state=state,
+        aspect=state.aspect,
         discovery_output=discovery_output,
         taxonomy_path=taxonomy_path,
         max_total_labels=args.max_total_labels,
-        min_create_support=args.min_create_support,
-        max_reconcile_groups=args.max_reconcile_groups,
-        reconcile_max_tokens=args.reconcile_max_tokens,
-        final_maintenance=False,
+        min_promotion_support=args.min_promotion_support,
+        max_screening_groups=args.max_screening_groups,
+        max_promotion_groups=args.max_promotion_groups,
+        maintenance_max_tokens=args.maintenance_max_tokens,
     )
 
-    # Final maintenance reconciliation to ensure that all deferred proposals are resolved and the taxonomy is frozen.
-    state = reconcile_pending(
+    # Existing dynamic-label cleanup is deliberately isolated from proposal work.
+    state = run_final_maintenance(
         model=model,
         state=state,
-        discovery_output=discovery_output,
+        aspect=state.aspect,
         taxonomy_path=taxonomy_path,
         max_total_labels=args.max_total_labels,
-        min_create_support=args.min_create_support,
-        max_reconcile_groups=args.max_reconcile_groups,
-        reconcile_max_tokens=args.reconcile_max_tokens,
-        final_maintenance=True,
+        min_promotion_support=args.min_promotion_support,
+        max_promotion_groups=args.max_promotion_groups,
+        max_revision_labels=args.max_revision_labels,
+        maintenance_max_tokens=args.maintenance_max_tokens,
     )
+
+    eligible_unpromoted = [
+        group
+        for group in state.candidate_proposals
+        if group.support_count >= args.min_promotion_support
+    ]
+    if eligible_unpromoted:
+        if len(active_labels(state)) < args.max_total_labels:
+            raise RuntimeError(
+                "Supported candidates remain after final promotion even though taxonomy "
+                "capacity is available; this indicates an orchestration bug"
+            )
+        LOGGER.warning(
+            "%d supported candidate groups remain unpromoted because the taxonomy "
+            "has reached --max-total-labels=%d",
+            len(eligible_unpromoted),
+            args.max_total_labels,
+        )
+
+    if state.candidate_proposals:
+        LOGGER.info(
+            "Freezing taxonomy with %d unpromoted candidate groups retained as "
+            "discovery audit evidence",
+            len(state.candidate_proposals),
+        )
 
     frozen_hash = taxonomy_hash(state)
     state = state.model_copy(

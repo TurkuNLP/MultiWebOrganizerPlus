@@ -33,6 +33,7 @@ paths:
 discovery:
   max_proposals_per_doc: 3
   max_assigned_labels_per_doc: 5
+  creativity: "low"  # one of: low, high
 
 reconcile:
   reconcile_every: 2048

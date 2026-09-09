@@ -2,6 +2,7 @@
 
 mode: "discover"  # choice: discover, classify
 aspect: "topics"
+run_name: "creative1"  # name of the run, used to create output directories and files
 
 model:
   name: "Qwen/Qwen3.8-27B"
@@ -19,13 +20,15 @@ model:
 paths:
   input: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/data/FineWebSample.jsonl"
   seed_labels: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/configs/seed_labels/topics.yaml"
-  taxonomy: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/results/full_run1/taxonomy_state.json"
-  discovery_output: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/results/full_run1/discovery.jsonl"
-  output: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/results/full_run1/final_labels.jsonl"
+  taxonomy: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/results/${run_name}/taxonomy_state.json"
+  discovery_output: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/results/${run_name}/discovery.jsonl"
+  output: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/results/${run_name}/final_labels.jsonl"
 
 discovery:
   max_proposals_per_doc: 3
   max_assigned_labels_per_doc: 5
+  creativity: "high"  # controls how eager the model is to propose new labels
+# choice: low, high
 
 maintenance:
   # Screen new proposal groups after this many newly persisted documents.
