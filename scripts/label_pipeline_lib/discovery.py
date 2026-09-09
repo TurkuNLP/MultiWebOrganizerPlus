@@ -1160,6 +1160,13 @@ def run_discovery(args: argparse.Namespace) -> None:
             )
 
             if last_seq - state.last_screened_discovery_seq >= args.screen_every:
+                LOGGER.info(
+                    "Maintenance: Screening %d new discovery records (seq %d..%d) against taxonomy v%d",
+                    last_seq - state.last_screened_discovery_seq,
+                    state.last_screened_discovery_seq + 1,
+                    last_seq,
+                    state.schema_version,
+                )
                 state = run_periodic_maintenance(
                     model=model,
                     state=state,
