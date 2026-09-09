@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any, Sequence, TypeVar
 
@@ -42,6 +43,7 @@ from label_pipeline_lib.schemas import (
     LabellingOutputSchema,
     ProposalGroup,
     ProposalScreeningOutput,
+    ProposedLabel,
     TaxonomyState,
 )
 
@@ -214,6 +216,124 @@ class ModelClient:
 
         return messages_for(low)
 
+    @staticmethod
+    def _repair_proposed_label_text(value: Any, field_name: str, debug_id: str) -> str:
+        if not isinstance(value, str):
+            raise TypeError(
+                f"{debug_id}: proposed_labels.{field_name} must be a string"
+            )
+
+        field_schema = ProposedLabel.model_json_schema()["properties"][field_name]
+        min_length = field_schema.get("minLength", 0)
+        max_length = field_schema.get("maxLength")
+        pattern = field_schema.get("pattern")
+        repaired = value.strip()
+        if max_length is not None and len(repaired) > max_length:
+            LOGGER.warning(
+                f"{debug_id}: Truncating proposed_labels.{field_name} to maxLength={max_length}"
+            )
+            repaired = repaired[:max_length]
+
+        if pattern and not re.fullmatch(pattern, repaired):
+            while len(repaired) >= min_length and not re.fullmatch(pattern, repaired):
+                for index in range(len(repaired)):
+                    candidate = repaired[:index] + repaired[index + 1 :]
+                    if len(candidate) >= min_length and re.fullmatch(
+                        pattern, candidate
+                    ):
+                        repaired = candidate
+                        break
+                else:
+                    repaired = repaired[1:]
+
+            if not re.fullmatch(pattern, repaired):
+                raise ValueError(
+                    f"{debug_id}: Could not repair proposed_labels.{field_name} to satisfy its schema"
+                )
+            else:
+                LOGGER.warning(
+                    f"{debug_id}: Repaired proposed_labels.{field_name} to satisfy its schema"
+                )
+
+        if len(repaired) < min_length:
+            raise ValueError(
+                f"{debug_id}: Could not repair proposed_labels.{field_name} to its minimum length"
+            )
+        return repaired
+
+    def _fix_model_output(
+        self, generated_text: str, debug_id: str, schema_spec: StructuredSchemaSpec[M]
+    ) -> dict:
+        """
+        Attempts to fix common issues in the model output which may cause validation errors.
+        Is not guaranteed to fix all issues, but can help with some common cases like duplicate label IDs.
+        """
+        payload = json.loads(generated_text)
+
+        # Forcefully deduplicate assigned_label_ids
+        if "assigned_label_ids" in payload and isinstance(
+            payload["assigned_label_ids"], list
+        ):
+            num_assigned_label_ids = len(payload["assigned_label_ids"])
+            payload["assigned_label_ids"] = list(
+                dict.fromkeys(payload["assigned_label_ids"])
+            )
+            num_deduplicated = len(payload["assigned_label_ids"])
+            if num_deduplicated < num_assigned_label_ids:
+                LOGGER.warning(
+                    f"{debug_id}: "
+                    f"model returned {num_assigned_label_ids - num_deduplicated} duplicate assigned_label_ids; "
+                    f"deduplicated to {num_deduplicated}."
+                )
+
+        if "proposed_labels" in payload and isinstance(
+            payload["proposed_labels"], list
+        ):
+            repaired_labels = []
+            signatures = set()
+            for label in payload["proposed_labels"]:
+                if not isinstance(label, dict):
+                    raise TypeError("Each proposed label must be an object")
+                for field_name in ("name", "definition"):
+                    if field_name in label:
+                        try:
+                            label[field_name] = self._repair_proposed_label_text(
+                                label[field_name], field_name, debug_id
+                            )
+                        except (TypeError, ValueError) as exc:
+                            LOGGER.warning(
+                                "%s: Dropping invalid proposed label: %s",
+                                debug_id,
+                                exc,
+                            )
+                            break
+                else:
+                    try:
+                        validated_label = ProposedLabel.model_validate(label)
+                    except ValidationError as exc:
+                        LOGGER.warning(
+                            "%s: Dropping proposed label that remains invalid: %s",
+                            debug_id,
+                            exc,
+                        )
+                        continue
+                    signature = (
+                        " ".join(validated_label.name.casefold().split()),
+                        " ".join(validated_label.definition.casefold().split()),
+                    )
+                    if signature in signatures:
+                        LOGGER.warning(
+                            "%s: Dropping duplicate proposed label %r",
+                            debug_id,
+                            signature,
+                        )
+                        continue
+                    signatures.add(signature)
+                    repaired_labels.append(label)
+            payload["proposed_labels"] = repaired_labels
+
+        return payload
+
     def _run_structured_chat(
         self,
         prompt_items: Sequence[PromptItem],
@@ -283,26 +403,10 @@ class ModelClient:
                     f"{prompt_items[index].debug_id}: model returned empty output"
                 )
             try:
-                payload = json.loads(generated_text)
-
-                # Forcefully deduplicate assigned_label_ids to avoid validation errors due to duplicates
-                # This is a workaround for cases where the model may return duplicate label IDs, which would violate the schema's constraints.
-                # Would be better to enforce uniqueness in the output itself, but that is not easily doable.
-                if "assigned_label_ids" in payload and isinstance(
-                    payload["assigned_label_ids"], list
-                ):
-                    num_assigned_label_ids = len(payload["assigned_label_ids"])
-                    payload["assigned_label_ids"] = list(
-                        dict.fromkeys(payload["assigned_label_ids"])
-                    )
-                    num_deduplicated = len(payload["assigned_label_ids"])
-                    if num_deduplicated < num_assigned_label_ids:
-                        LOGGER.warning(
-                            f"{prompt_items[index].debug_id}: "
-                            f"model returned {num_assigned_label_ids - num_deduplicated} duplicate assigned_label_ids; "
-                            f"deduplicated to {num_deduplicated}."
-                        )
-                parsed.append(schema_spec.model_type.model_validate(payload))
+                fixed_output_json = self._fix_model_output(
+                    generated_text, prompt_items[index].debug_id, schema_spec
+                )
+                parsed.append(schema_spec.model_type.model_validate(fixed_output_json))
             except ValidationError as exc:
                 preview = generated_text[:2000]
                 raise ValueError(
