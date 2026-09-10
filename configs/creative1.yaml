@@ -35,7 +35,7 @@ maintenance:
   screen_every: 2048
 
   # Bound each model-facing maintenance call.
-  max_screening_groups: 32
+  max_screening_groups: 16
   max_promotion_groups: 16
   max_revision_labels: 16
 
