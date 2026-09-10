@@ -1,0 +1,23 @@
+Bootstrap: docker
+From: docker.io/rockylinux/rockylinux:9.8
+
+%files
+    # Copy requirements.txt to container /opt
+    /scratch/project_2020507/users/tarkkaot/MultiWebOrganizerPlus/requirements.txt /opt/requirements.txt
+
+%post
+    # Install Python, pip, devel headers and compilers.
+    dnf -y update
+    dnf -y install python3.12 python3.12-pip python3.12-devel gcc gcc-c++ make
+    dnf -y clean all
+
+    # Create a Python virtual environment and install packages from requirements.txt.
+    python3.12 -m venv /opt/venv
+    export PATH=/opt/venv/bin:$PATH
+    python -m pip install --upgrade pip
+    python -m pip install --no-cache-dir -r /opt/requirements.txt
+
+%environment
+    export PATH=/opt/venv/bin:$PATH
+    export CC=/usr/bin/gcc
+    export CXX=/usr/bin/g++
