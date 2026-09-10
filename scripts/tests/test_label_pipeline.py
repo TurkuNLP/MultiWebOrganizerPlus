@@ -41,6 +41,7 @@ from label_pipeline_lib.common import (  # noqa: E402
     validate_taxonomy_state,
 )
 from label_pipeline_lib.compute_logger import detect_num_gpus  # noqa: E402
+from label_pipeline_lib.model import ModelClient, StructuredModelOutputError  # noqa: E402
 from label_pipeline_lib.discovery import (  # noqa: E402
     accumulate_existing_candidate_support,
     apply_candidate_promotion,
@@ -80,6 +81,7 @@ from label_pipeline_lib.schemas import (  # noqa: E402
 from label_pipeline_lib.structured_schemas import (  # noqa: E402
     build_proposal_screening_output_schema,
 )
+from label_pipeline_lib.prompts import build_proposal_screening_messages  # noqa: E402
 
 
 def make_state() -> TaxonomyState:
@@ -92,7 +94,7 @@ def make_state() -> TaxonomyState:
         input_size_bytes=1,
         input_mtime_ns=1,
         model_name="test-model",
-        vllm_version="0.22.1",
+        vllm_version="0.19.1",
         batch_size=4,
         max_model_len=32768,
         max_document_tokens=8192,
@@ -371,19 +373,421 @@ def test_old_taxonomy_format_version_fails_validation() -> None:
         TaxonomyState.model_validate(payload)
 
 
-def test_screening_json_schema_has_exact_decision_count_and_enums() -> None:
+def test_screening_json_schema_uses_required_proposal_keys() -> None:
     spec = build_proposal_screening_output_schema(
         valid_proposal_group_ids=["P001", "P002"],
         valid_target_label_ids=["L001", "L002"],
     )
-    decisions = spec.json_schema["properties"]["decisions"]
-    assert decisions["minItems"] == 2
-    assert decisions["maxItems"] == 2
 
-    keep_id_schema = spec.json_schema["$defs"]["KeepCandidateDecision"]["properties"][
-        "proposal_group_id"
+    decisions = spec.json_schema["properties"]["decisions"]
+    assert decisions["type"] == "object"
+    assert list(decisions["properties"]) == ["P001", "P002"]
+    assert decisions["required"] == ["P001", "P002"]
+    assert decisions["additionalProperties"] is False
+
+    p001_variants = decisions["properties"]["P001"]["oneOf"]
+    map_existing = next(
+        variant
+        for variant in p001_variants
+        if variant["properties"]["action"].get("const") == "map_existing"
+    )
+    assert map_existing["properties"]["target_label_id"]["enum"] == [
+        "L001",
+        "L002",
     ]
-    assert keep_id_schema["enum"] == ["P001", "P002"]
+    assert "proposal_group_id" not in map_existing["properties"]
+
+
+def test_screening_boundary_model_converts_keyed_output_to_canonical_order() -> None:
+    spec = build_proposal_screening_output_schema(
+        valid_proposal_group_ids=["P001", "P002"],
+        valid_target_label_ids=["L001", "L002"],
+    )
+
+    # Deliberately reverse JSON key order. Canonical output follows caller order.
+    result = spec.model_type.model_validate(
+        {
+            "decisions": {
+                "P002": {"action": "map_existing", "target_label_id": "L002"},
+                "P001": {"action": "keep_candidate"},
+            }
+        }
+    )
+
+    assert isinstance(result, ProposalScreeningOutput)
+    assert [decision.proposal_group_id for decision in result.decisions] == [
+        "P001",
+        "P002",
+    ]
+    assert result.decisions[0].action == "keep_candidate"
+    assert result.decisions[1].action == "map_existing"
+    assert result.decisions[1].target_label_id == "L002"
+
+
+@pytest.mark.parametrize(
+    "payload,match",
+    [
+        (
+            {"decisions": {"P001": {"action": "keep_candidate"}}},
+            "coverage mismatch",
+        ),
+        (
+            {
+                "decisions": {
+                    "P001": {"action": "keep_candidate"},
+                    "P002": {"action": "discard_candidate"},
+                    "P999": {"action": "keep_candidate"},
+                }
+            },
+            "coverage mismatch",
+        ),
+        (
+            {
+                "decisions": {
+                    "P001": {
+                        "action": "keep_candidate",
+                        "proposal_group_id": "P001",
+                    },
+                    "P002": {"action": "discard_candidate"},
+                }
+            },
+            "must not contain proposal_group_id",
+        ),
+        (
+            {
+                "decisions": {
+                    "P001": {"action": "keep_candidate"},
+                    "P002": {
+                        "action": "map_existing",
+                        "target_label_id": "L999",
+                    },
+                }
+            },
+            "unknown target label",
+        ),
+    ],
+)
+def test_screening_boundary_model_rejects_malformed_keyed_output(
+    payload: dict[str, object], match: str
+) -> None:
+    spec = build_proposal_screening_output_schema(
+        valid_proposal_group_ids=["P001", "P002"],
+        valid_target_label_ids=["L001", "L002"],
+    )
+    with pytest.raises(ValidationError, match=match):
+        spec.model_type.model_validate(payload)
+
+
+def test_screening_prompt_describes_keyed_output_and_aspect() -> None:
+    state = make_state()
+    groups = [
+        ProposalGroup(
+            group_id="P001",
+            name="Quantum computing",
+            definition="Documents centrally about quantum computing.",
+            support_count=1,
+        )
+    ]
+    messages = build_proposal_screening_messages(state, groups, aspect="format")
+    system = messages[0]["content"]
+
+    assert "aspect: format" in system
+    assert "`decisions` is a JSON object, not a list" in system
+    assert "Do NOT include `proposal_group_id` inside a decision value" in system
+    assert "P001" in system
+
+
+
+def _make_screening_groups(count: int) -> list[ProposalGroup]:
+    return [
+        ProposalGroup(
+            group_id=f"G{index}",
+            name=f"Candidate {index}",
+            definition=f"Documents centrally about candidate {index}.",
+            support_count=1,
+        )
+        for index in range(1, count + 1)
+    ]
+
+
+def test_model_screening_fast_path_submits_all_chunks_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = ModelClient.__new__(ModelClient)
+    calls: list[list[int]] = []
+
+    def fake_once(
+        state: TaxonomyState,
+        proposal_batches: list[list[ProposalGroup]],
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> list[ProposalScreeningOutput]:
+        calls.append([len(batch) for batch in proposal_batches])
+        return [
+            ProposalScreeningOutput(
+                decisions=[
+                    KeepCandidateDecision(
+                        action="keep_candidate",
+                        proposal_group_id=group.group_id,
+                    )
+                    for group in batch
+                ]
+            )
+            for batch in proposal_batches
+        ]
+
+    monkeypatch.setattr(client, "_screen_proposal_batches_once", fake_once)
+    groups = _make_screening_groups(3)
+    results = client.screen_proposal_batches(
+        make_state(),
+        [groups[:2], groups[2:]],
+        "topics",
+        max_tokens=512,
+    )
+
+    assert calls == [[2, 1]]
+    assert [
+        [decision.proposal_group_id for decision in result.decisions]
+        for result in results
+    ] == [["G1", "G2"], ["G3"]]
+
+
+def test_model_screening_recovery_splits_malformed_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = ModelClient.__new__(ModelClient)
+    calls: list[list[int]] = []
+
+    def fail_large_succeed_singletons(
+        state: TaxonomyState,
+        proposal_batches: list[list[ProposalGroup]],
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> list[ProposalScreeningOutput]:
+        sizes = [len(batch) for batch in proposal_batches]
+        calls.append(sizes)
+        if len(proposal_batches) > 1 or any(size > 1 for size in sizes):
+            raise StructuredModelOutputError("synthetic malformed screening output")
+        batch = proposal_batches[0]
+        return [
+            ProposalScreeningOutput(
+                decisions=[
+                    KeepCandidateDecision(
+                        action="keep_candidate",
+                        proposal_group_id=batch[0].group_id,
+                    )
+                ]
+            )
+        ]
+
+    monkeypatch.setattr(
+        client,
+        "_screen_proposal_batches_once",
+        fail_large_succeed_singletons,
+    )
+    groups = _make_screening_groups(3)
+    results = client.screen_proposal_batches(
+        make_state(),
+        [groups[:2], groups[2:]],
+        "topics",
+        max_tokens=512,
+    )
+
+    assert [
+        decision.proposal_group_id
+        for result in results
+        for decision in result.decisions
+    ] == ["G1", "G2", "G3"]
+    # First attempt is one scheduler batch; recovery then shrinks the bad chunk.
+    assert calls[0] == [2, 1]
+    assert [2] in calls
+    assert calls.count([1]) >= 3
+
+
+def test_model_screening_singleton_failure_falls_back_to_keep_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = ModelClient.__new__(ModelClient)
+
+    def always_fail(
+        state: TaxonomyState,
+        proposal_batches: list[list[ProposalGroup]],
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> list[ProposalScreeningOutput]:
+        raise StructuredModelOutputError("synthetic persistent malformed output")
+
+    monkeypatch.setattr(client, "_screen_proposal_batches_once", always_fail)
+    group = _make_screening_groups(1)[0]
+
+    with caplog.at_level("WARNING"):
+        result = client.screen_proposals(
+            make_state(),
+            [group],
+            "topics",
+            max_tokens=512,
+        )
+
+    assert len(result.decisions) == 1
+    assert result.decisions[0].action == "keep_candidate"
+    assert result.decisions[0].proposal_group_id == "G1"
+    assert "RECOVERY: singleton proposal screening remained malformed" in caplog.text
+    assert "No malformed model decision was accepted" in caplog.text
+
+def _make_screening_groups(count: int) -> list[ProposalGroup]:
+    return [
+        ProposalGroup(
+            group_id=f"G{index}",
+            name=f"Candidate {index}",
+            definition=f"Documents centrally about candidate {index}.",
+            support_count=1,
+        )
+        for index in range(1, count + 1)
+    ]
+
+
+def test_model_screening_fast_path_submits_all_chunks_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = ModelClient.__new__(ModelClient)
+    calls: list[list[int]] = []
+
+    def fake_once(
+        state: TaxonomyState,
+        proposal_batches: list[list[ProposalGroup]],
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> list[ProposalScreeningOutput]:
+        calls.append([len(batch) for batch in proposal_batches])
+        return [
+            ProposalScreeningOutput(
+                decisions=[
+                    KeepCandidateDecision(
+                        action="keep_candidate",
+                        proposal_group_id=group.group_id,
+                    )
+                    for group in batch
+                ]
+            )
+            for batch in proposal_batches
+        ]
+
+    monkeypatch.setattr(client, "_screen_proposal_batches_once", fake_once)
+    groups = _make_screening_groups(3)
+    results = client.screen_proposal_batches(
+        make_state(),
+        [groups[:2], groups[2:]],
+        "topics",
+        max_tokens=512,
+    )
+
+    assert calls == [[2, 1]]
+    assert [
+        [decision.proposal_group_id for decision in result.decisions]
+        for result in results
+    ] == [["G1", "G2"], ["G3"]]
+
+
+def test_model_screening_recovery_splits_malformed_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = ModelClient.__new__(ModelClient)
+    calls: list[list[int]] = []
+
+    def fail_large_succeed_singletons(
+        state: TaxonomyState,
+        proposal_batches: list[list[ProposalGroup]],
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> list[ProposalScreeningOutput]:
+        sizes = [len(batch) for batch in proposal_batches]
+        calls.append(sizes)
+        if len(proposal_batches) > 1 or any(size > 1 for size in sizes):
+            raise StructuredModelOutputError("synthetic malformed screening output")
+
+        group = proposal_batches[0][0]
+        return [
+            ProposalScreeningOutput(
+                decisions=[
+                    KeepCandidateDecision(
+                        action="keep_candidate",
+                        proposal_group_id=group.group_id,
+                    )
+                ]
+            )
+        ]
+
+    monkeypatch.setattr(
+        client,
+        "_screen_proposal_batches_once",
+        fail_large_succeed_singletons,
+    )
+    groups = _make_screening_groups(3)
+    results = client.screen_proposal_batches(
+        make_state(),
+        [groups[:2], groups[2:]],
+        "topics",
+        max_tokens=512,
+    )
+
+    assert [
+        decision.proposal_group_id
+        for result in results
+        for decision in result.decisions
+    ] == ["G1", "G2", "G3"]
+    assert calls[0] == [2, 1]
+    assert [2] in calls
+    assert calls.count([1]) >= 3
+
+
+def test_model_screening_singleton_failure_falls_back_to_keep_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = ModelClient.__new__(ModelClient)
+
+    def always_fail(
+        state: TaxonomyState,
+        proposal_batches: list[list[ProposalGroup]],
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> list[ProposalScreeningOutput]:
+        raise StructuredModelOutputError("synthetic persistent malformed output")
+
+    monkeypatch.setattr(client, "_screen_proposal_batches_once", always_fail)
+    group = _make_screening_groups(1)[0]
+
+    with caplog.at_level("WARNING"):
+        result = client.screen_proposals(
+            make_state(),
+            [group],
+            "topics",
+            max_tokens=512,
+        )
+
+    assert len(result.decisions) == 1
+    assert result.decisions[0].action == "keep_candidate"
+    assert result.decisions[0].proposal_group_id == "G1"
+    assert "RECOVERY: singleton proposal screening remained malformed" in caplog.text
+    assert "No malformed model decision was accepted" in caplog.text
+
+
+def test_model_final_revision_signature_matches_discovery_call() -> None:
+    client = ModelClient.__new__(ModelClient)
+    result = client.final_revision_pass(
+        make_state(),
+        [],
+        aspect="topics",
+        max_tokens=512,
+    )
+    assert result.revisions == []
 
 
 def test_configured_gpu_count_is_used_for_compute_accounting() -> None:
@@ -414,29 +818,9 @@ def test_input_document_rejects_blank_core_fields() -> None:
 
 
 class _KeepAllScreeningModel:
-    def __init__(self, *, fail_on_call: int | None = None) -> None:
-        self.call_sizes: list[int] = []
-        self.fail_on_call = fail_on_call
-
-    def screen_proposals(
-        self,
-        state: TaxonomyState,
-        proposal_groups: list[ProposalGroup],
-        aspect: str,
-        *,
-        max_tokens: int,
-    ) -> ProposalScreeningOutput:
-        self.call_sizes.append(len(proposal_groups))
-        if self.fail_on_call is not None and len(self.call_sizes) == self.fail_on_call:
-            raise RuntimeError("synthetic screening failure")
-        return ProposalScreeningOutput(
-            decisions=[
-                KeepCandidateDecision(
-                    action="keep_candidate", proposal_group_id=group.group_id
-                )
-                for group in proposal_groups
-            ]
-        )
+    def __init__(self, *, fail_batch: bool = False) -> None:
+        self.batch_call_sizes: list[list[int]] = []
+        self.fail_batch = fail_batch
 
     def screen_proposal_batches(
         self,
@@ -446,12 +830,18 @@ class _KeepAllScreeningModel:
         *,
         max_tokens: int,
     ) -> list[ProposalScreeningOutput]:
+        self.batch_call_sizes.append([len(batch) for batch in proposal_batches])
+        if self.fail_batch:
+            raise RuntimeError("synthetic screening failure")
         return [
-            self.screen_proposals(
-                state,
-                proposal_groups,
-                aspect,
-                max_tokens=max_tokens,
+            ProposalScreeningOutput(
+                decisions=[
+                    KeepCandidateDecision(
+                        action="keep_candidate",
+                        proposal_group_id=group.group_id,
+                    )
+                    for group in proposal_groups
+                ]
             )
             for proposal_groups in proposal_batches
         ]
@@ -477,7 +867,7 @@ def _write_discovery_records(path: Path, count: int) -> None:
     append_models_jsonl(path, records)
 
 
-def test_screening_groups_are_chunked_per_model_call(tmp_path: Path) -> None:
+def test_screening_groups_are_submitted_in_one_batched_call(tmp_path: Path) -> None:
     state = make_state()
     discovery_path = tmp_path / "discovery.jsonl"
     taxonomy_path = tmp_path / "taxonomy.json"
@@ -496,7 +886,7 @@ def test_screening_groups_are_chunked_per_model_call(tmp_path: Path) -> None:
         maintenance_max_tokens=1024,
     )
 
-    assert model.call_sizes == [2, 2, 1]
+    assert model.batch_call_sizes == [[2, 2, 1]]
     assert updated.last_screened_discovery_seq == 5
     assert len(updated.candidate_proposals) == 5
     persisted = load_model_file(taxonomy_path, TaxonomyState)
@@ -513,7 +903,7 @@ def test_screening_chunk_failure_does_not_advance_persisted_cursor(
     _write_discovery_records(discovery_path, 5)
     atomic_write_model(taxonomy_path, state)
 
-    model = _KeepAllScreeningModel(fail_on_call=2)
+    model = _KeepAllScreeningModel(fail_batch=True)
     with pytest.raises(RuntimeError, match="synthetic screening failure"):
         screen_new_proposals(
             model=model,  # type: ignore[arg-type]
@@ -689,7 +1079,7 @@ def test_discovery_output_rejects_duplicate_proposal_evidence() -> None:
         '{"assigned_label_ids":[],"proposed_labels":['
         '{"name":"Quantum Computing","definition":"Documents about quantum computing."},'
         '{"name":" quantum   computing ","definition":"Documents about quantum computing."}'
-        "]}"
+        ']}'
     )
     with pytest.raises(ValidationError, match="duplicate normalized"):
         LabellingOutputSchema.model_validate_json(payload)
@@ -918,7 +1308,8 @@ class _EndToEndClassificationModel:
         **kwargs: object,
     ) -> list[FrozenClassificationOutputSchema]:
         return [
-            FrozenClassificationOutputSchema(assigned_label_ids=["L001"]) for _ in docs
+            FrozenClassificationOutputSchema(assigned_label_ids=["L001"])
+            for _ in docs
         ]
 
 
@@ -1022,18 +1413,14 @@ def test_end_to_end_discovery_freeze_and_classification_resume(
         ]
     )
     validate_cli_args(classify_args)
-    monkeypatch.setattr(
-        classification_module, "ModelClient", _EndToEndClassificationModel
-    )
+    monkeypatch.setattr(classification_module, "ModelClient", _EndToEndClassificationModel)
     classification_module.run_classification(classify_args)
 
     final_records = list(
         classification_module.iter_jsonl_models(final_path, FinalClassificationRecord)
     )
     assert len(final_records) == 4
-    assert all(
-        record.taxonomy_hash == state.frozen_taxonomy_hash for record in final_records
-    )
+    assert all(record.taxonomy_hash == state.frozen_taxonomy_hash for record in final_records)
 
     # Running the same frozen classification again must resume cleanly without
     # duplicating already-persisted records.

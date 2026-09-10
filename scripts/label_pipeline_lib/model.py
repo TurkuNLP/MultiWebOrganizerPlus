@@ -50,6 +50,10 @@ from label_pipeline_lib.schemas import (
 M = TypeVar("M", bound=BaseModel)
 
 
+class StructuredModelOutputError(RuntimeError):
+    """The model returned a completion that violated the structured-output contract."""
+
+
 class ModelClient:
     def __init__(
         self,
@@ -149,7 +153,7 @@ class ModelClient:
         input_throughput = input_tokens / elapsed_seconds
         output_throughput = generated_tokens / elapsed_seconds
         LOGGER.info(
-            "Throughput: Processed %d total tokens in %.3f seconds (%.2f tokens/sec (input: %.2f tokens/sec, output: %.2f tokens/sec))",
+            "Processed %d total tokens in %.3f seconds (%.2f tokens/sec (input: %.2f tokens/sec, output: %.2f tokens/sec))",
             input_tokens + generated_tokens,
             elapsed_seconds,
             total_throughput,
@@ -279,8 +283,7 @@ class ModelClient:
         if "assigned_label_ids" in payload and isinstance(
             payload["assigned_label_ids"], list
         ):
-            assigned_label_ids = payload["assigned_label_ids"]
-            num_assigned_label_ids = len(assigned_label_ids)
+            num_assigned_label_ids = len(payload["assigned_label_ids"])
             payload["assigned_label_ids"] = list(
                 dict.fromkeys(payload["assigned_label_ids"])
             )
@@ -289,7 +292,7 @@ class ModelClient:
                 LOGGER.warning(
                     f"{debug_id}: model returned "
                     f"{num_assigned_label_ids - num_deduplicated} duplicate "
-                    f"assigned_label_ids ({', '.join(assigned_label_ids)}); deduplicated to {num_deduplicated}."
+                    f"assigned_label_ids; deduplicated to {num_deduplicated}."
                 )
 
         if "proposed_labels" in payload and isinstance(
@@ -399,9 +402,6 @@ class ModelClient:
                 f"vLLM returned {len(outputs)} outputs for {len(messages)} prompts"
             )
 
-        # Validate output cardinality before indexing completions for throughput
-        # accounting, so malformed vLLM responses fail with the prompt debug ID
-        # instead of an unrelated IndexError.
         for index, request_output in enumerate(outputs):
             if len(request_output.outputs) != 1:
                 raise RuntimeError(
@@ -423,7 +423,7 @@ class ModelClient:
             current_spec = specs[index]
 
             if completion.finish_reason != "stop":
-                raise RuntimeError(
+                raise StructuredModelOutputError(
                     f"{prompt_items[index].debug_id}: generation ended with finish_reason="
                     f"{completion.finish_reason!r}; output may be truncated.\n"
                     f"Configured max_tokens={max_tokens}\n"
@@ -433,7 +433,7 @@ class ModelClient:
 
             generated_text = completion.text
             if not generated_text:
-                raise RuntimeError(
+                raise StructuredModelOutputError(
                     f"{prompt_items[index].debug_id}: model returned empty output"
                 )
 
@@ -444,9 +444,14 @@ class ModelClient:
                     current_spec,
                 )
                 parsed.append(current_spec.model_type.model_validate(fixed_output_json))
-            except ValidationError as exc:
+            except (
+                ValidationError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+            ) as exc:
                 preview = generated_text[:2000]
-                raise ValueError(
+                raise StructuredModelOutputError(
                     f"{prompt_items[index].debug_id}: model output failed "
                     f"{current_spec.model_type.__name__} validation: {exc}. "
                     f"Output preview: {preview!r}"
@@ -667,7 +672,7 @@ class ModelClient:
             )
         return result.model_copy(update={"new_labels": translated_labels})
 
-    def screen_proposal_batches(
+    def _screen_proposal_batches_once(
         self,
         state: TaxonomyState,
         proposal_batches: Sequence[Sequence[ProposalGroup]],
@@ -675,20 +680,18 @@ class ModelClient:
         *,
         max_tokens: int,
     ) -> list[ProposalScreeningOutput]:
-        """Screen independent proposal chunks in one vLLM scheduler batch.
-
-        Each chunk keeps its own short local proposal IDs and its own dynamically
-        constrained JSON schema. The chunks all see the same taxonomy snapshot.
-        """
+        """Run one strict screening scheduler batch with no recovery."""
         batches = [list(batch) for batch in proposal_batches]
         if not batches:
             return []
         if any(not batch for batch in batches):
             raise ValueError(
-                "screen_proposal_batches does not accept empty proposal batches"
+                "_screen_proposal_batches_once does not accept empty proposal batches"
             )
         if not aspect:
-            raise ValueError("screen_proposal_batches requires a non-empty aspect")
+            raise ValueError(
+                "_screen_proposal_batches_once requires a non-empty aspect"
+            )
 
         valid_target_label_ids = [label.id for label in state.seed_labels] + [
             label.id for label in state.dynamic_labels
@@ -746,10 +749,136 @@ class ModelClient:
                 f"Expected {len(batches)} screening results, got {len(results)}"
             )
 
-        return [
-            self._translate_screening_ids(result, local_to_global)
-            for result, local_to_global in zip(results, translations, strict=True)
-        ]
+        translated: list[ProposalScreeningOutput] = []
+        for result, local_to_global in zip(results, translations, strict=True):
+            try:
+                translated.append(
+                    self._translate_screening_ids(result, local_to_global)
+                )
+            except ValueError as exc:
+                raise StructuredModelOutputError(
+                    f"Proposal screening ID translation failed: {exc}"
+                ) from exc
+        return translated
+
+    def _screen_proposals_resilient(
+        self,
+        state: TaxonomyState,
+        proposal_groups: Sequence[ProposalGroup],
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> ProposalScreeningOutput:
+        """Screen one chunk, recursively shrinking it after malformed model output.
+
+        The fallback is deterministic. Multi-proposal failures are split in half and
+        rescreened. If a singleton still cannot produce valid structured output, keep
+        that proposal as a candidate rather than crashing or irreversibly discarding
+        discovery evidence.
+        """
+        groups = list(proposal_groups)
+        if not groups:
+            raise ValueError(
+                "_screen_proposals_resilient requires at least one proposal group"
+            )
+
+        try:
+            results = self._screen_proposal_batches_once(
+                state,
+                [groups],
+                aspect,
+                max_tokens=max_tokens,
+            )
+            if len(results) != 1:
+                raise RuntimeError(f"Expected one screening result, got {len(results)}")
+            return results[0]
+        except StructuredModelOutputError as exc:
+            if len(groups) == 1:
+                group = groups[0]
+                LOGGER.warning(
+                    "RECOVERY: singleton proposal screening remained malformed for "
+                    "%s at taxonomy v%d; conservatively using keep_candidate. "
+                    "No malformed model decision was accepted. Error: %s",
+                    group.group_id,
+                    state.schema_version,
+                    exc,
+                )
+                return ProposalScreeningOutput.model_validate(
+                    {
+                        "decisions": [
+                            {
+                                "action": "keep_candidate",
+                                "proposal_group_id": group.group_id,
+                            }
+                        ]
+                    }
+                )
+
+            midpoint = len(groups) // 2
+            left_groups = groups[:midpoint]
+            right_groups = groups[midpoint:]
+            LOGGER.warning(
+                "RECOVERY: malformed proposal-screening output for %d groups at "
+                "taxonomy v%d; rescreening as chunks of %d and %d. Error: %s",
+                len(groups),
+                state.schema_version,
+                len(left_groups),
+                len(right_groups),
+                exc,
+            )
+
+            left = self._screen_proposals_resilient(
+                state, left_groups, aspect, max_tokens=max_tokens
+            )
+            right = self._screen_proposals_resilient(
+                state, right_groups, aspect, max_tokens=max_tokens
+            )
+            return ProposalScreeningOutput.model_validate(
+                {"decisions": [*left.decisions, *right.decisions]}
+            )
+
+    def screen_proposal_batches(
+        self,
+        state: TaxonomyState,
+        proposal_batches: Sequence[Sequence[ProposalGroup]],
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> list[ProposalScreeningOutput]:
+        """Screen independent chunks in one vLLM batch with safe recovery.
+
+        The fast path submits all chunks concurrently. If any completion violates the
+        structured-output contract, the failed scheduler batch is not accepted; chunks
+        are rescreened independently with recursive splitting only as needed.
+        """
+        batches = [list(batch) for batch in proposal_batches]
+        if not batches:
+            return []
+        if any(not batch for batch in batches):
+            raise ValueError(
+                "screen_proposal_batches does not accept empty proposal batches"
+            )
+        if not aspect:
+            raise ValueError("screen_proposal_batches requires a non-empty aspect")
+
+        try:
+            return self._screen_proposal_batches_once(
+                state, batches, aspect, max_tokens=max_tokens
+            )
+        except StructuredModelOutputError as exc:
+            LOGGER.warning(
+                "RECOVERY: at least one proposal-screening chunk in a %d-chunk "
+                "scheduler batch returned malformed output. Rescreening chunks "
+                "independently. Error: %s",
+                len(batches),
+                exc,
+            )
+            return [
+                self._screen_proposals_resilient(
+                    state, batch, aspect, max_tokens=max_tokens
+                )
+                for batch in batches
+            ]
 
     def screen_proposals(
         self,
@@ -761,18 +890,11 @@ class ModelClient:
     ) -> ProposalScreeningOutput:
         if not proposal_groups:
             raise ValueError("screen_proposals requires at least one proposal group")
-
-        results = self.screen_proposal_batches(
-            state,
-            [proposal_groups],
-            aspect,
-            max_tokens=max_tokens,
+        if not aspect:
+            raise ValueError("screen_proposals requires a non-empty aspect")
+        return self._screen_proposals_resilient(
+            state, proposal_groups, aspect, max_tokens=max_tokens
         )
-        if len(results) != 1:
-            raise RuntimeError(
-                f"screen_proposals expected one result, got {len(results)}"
-            )
-        return results[0]
 
     def promote_candidates(
         self,
@@ -838,8 +960,8 @@ class ModelClient:
     def final_revision_pass(
         self,
         state: TaxonomyState,
-        aspect: str,
         review_label_ids: Sequence[str],
+        aspect: str,
         *,
         max_tokens: int,
     ) -> FinalRevisionOutput:
