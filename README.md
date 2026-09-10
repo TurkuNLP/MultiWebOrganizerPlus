@@ -10,27 +10,29 @@ taxonomy. The seed labels are derived from [WebOrganizer](https://github.com/Cod
 The entrypoint is `scripts/label_pipeline.py`, which dispatches to one of two modes: discovery or classification. The discovery mode iteratively discovers and reconciles labels, while the classification mode assigns labels to documents using a frozen taxonomy. The following diagram illustrates the pipeline flow:
 
 ```text
-input JSONL + seed labels
-						 |
-						 v
-			 discovery mode
-						 |
-	model labels documents and
+     input JSONL + seed labels
+				|
+				v
+		  discovery mode
+				|
+				v
+	 model labels documents and
 	proposes missing topic labels
-						 |
-						 v
-		periodic reconciliation
-	defer / reject / map / create
+				|
+				v
+		periodic maintenance
+		keep / reject / map
+	 promote / keep as candidate
 	merge or revise dynamic labels
-						 |
-						 v
+				|
+				v
 	frozen taxonomy_state.json
-						 |
-						 v
-			 classify mode
-						 |
-						 v
-		 final_labels.jsonl
+				|
+				v
+		  classify mode
+				|
+				v
+		final_labels.jsonl
 ```
 
 ### Discovery
@@ -42,23 +44,16 @@ returns:
 - `proposed_labels`: candidate labels with a name and definition.
 
 The validated result is appended to `discovery.jsonl`. Every
-`--reconcile-every` documents, the pipeline groups equivalent proposals and
-asks the model to resolve every group. A proposal can be deferred, rejected,
-mapped to an existing label, or created as a new dynamic label. Existing
-dynamic labels may also be merged or revised. The taxonomy state records the
-schema version, aliases, deferred proposals, reconciliation history, and the
-last processed discovery sequence.
-
-After the input is exhausted, a final reconciliation resolves all deferred
-proposals without allowing new deferrals. The taxonomy is then marked frozen
-and receives a content hash. A frozen taxonomy cannot be used to resume
-discovery; start a new run if a new taxonomy is required.
+`--reconcile-every` documents, the pipeline does a maintenance run that
+goes through newly proposed labels, and either accepts, rejects, or maps them to existing labels. After an accepted proposal gain enough support, it can be promoted to a dynamic label. Existing dynamic labels may also be merged or revised. The taxonomy state records the schema version, aliases, deferred proposals, reconciliation history, and the last processed discovery sequence.
 
 Discovery is resumable. Existing `discovery.jsonl` records are checked for
 contiguous sequence numbers and duplicate document IDs, and completed
 documents are skipped. Resuming requires the same input fingerprint, seed
 labels, model settings, and discovery settings that are stored in the
 taxonomy state.
+
+After the input is exhausted, a final reconciliation resolves all remaining proposals and ensures a consistent taxonomy with no more than `max_total_labels` labels. The taxonomy is then marked frozen and receives a content hash. A frozen taxonomy cannot be used to resume discovery; start a new run if a new taxonomy is required.
 
 ### Classification
 
@@ -85,14 +80,11 @@ classification output again.
 
 ## Requirements
 
-The pipeline requires Python with the packages used by the scripts, including
-vLLM, PyTorch, Transformers, Pydantic, and PyYAML, plus a compatible GPU
-environment and access to the configured Hugging Face model. On LUMI, use the
-provided container image described in `environments/lumi/README.md`.
+The pipeline requires Python 3.12 with the packages listed in `requirements.txt`, plus a compatible GPU environment and access to the configured Hugging Face model. On CSC machines, use one of the provided container images described in `environments/lumi/README.md`.
 
 The model is downloaded and cached by Hugging Face. Set `HF_HOME` (or the
 relevant Hugging Face cache variables) to a persistent location with enough
-space before submitting a long run.
+space before submitting a long run. I also recommend setting `VLLM_CACHE_ROOT` to a persistent location with enough space for the vLLM cache.
 
 ## Prepare a Run
 
@@ -127,7 +119,7 @@ space before submitting a long run.
 	 Important settings include `model.name`, `model.tensor_parallel_size`,
 	 `model.batch_size` and `reconcile.reconcile_every`.
 
-## Run on LUMI
+## Run on CSC LUMI/Roihu
 
 1. Edit `hpc/lumi/discover_topic_labels.sh` and replace its project-specific
 	 `base_dir`, model/cache locations, and Slurm resources as needed. The script
