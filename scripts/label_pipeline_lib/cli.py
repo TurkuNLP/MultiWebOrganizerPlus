@@ -26,7 +26,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Run name substituted for ${run_name} in configured paths",
     )
     parser.add_argument(
-        "--input", default=None, help="Input JSONL with doc_id and text"
+        "--jsonl-input", default=None, help="Input JSONL with doc_id and text"
+    )
+    parser.add_argument(
+        "--dataset-input",
+        default=None,
+        help="Hugging Face dataset repository to stream",
+    )
+    parser.add_argument("--dataset-config", default=None)
+    parser.add_argument("--dataset-split", default="train")
+    parser.add_argument(
+        "--max-documents",
+        type=int,
+        default=None,
+        help="Stop once this many total documents have been processed across runs",
     )
     parser.add_argument(
         "--taxonomy",
@@ -162,7 +175,6 @@ def validate_cli_args(args: argparse.Namespace) -> None:
         )
 
     shared_string_fields = (
-        "input",
         "taxonomy",
         "model",
         "aspect",
@@ -172,6 +184,13 @@ def validate_cli_args(args: argparse.Namespace) -> None:
     for field in shared_string_fields:
         value = getattr(args, field)
         if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"--{field.replace('_', '-')} must be a non-empty string")
+
+    if bool(args.jsonl_input) == bool(args.dataset_input):
+        raise ValueError("Specify exactly one of --jsonl-input or --dataset-input")
+    for field in ("dataset_config", "dataset_split"):
+        value = getattr(args, field)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
             raise ValueError(f"--{field.replace('_', '-')} must be a non-empty string")
 
     mode_path_fields = (
@@ -210,6 +229,13 @@ def validate_cli_args(args: argparse.Namespace) -> None:
         value = getattr(args, field)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"--{field.replace('_', '-')} must be an integer >= 1")
+
+    if args.max_documents is not None and (
+        isinstance(args.max_documents, bool)
+        or not isinstance(args.max_documents, int)
+        or args.max_documents < 1
+    ):
+        raise ValueError("--max-documents must be an integer >= 1")
 
     if args.classification_max_tokens >= args.max_model_len:
         raise ValueError(
@@ -321,7 +347,10 @@ def _load_config_defaults(parser: argparse.ArgumentParser) -> dict:
                 "thinking_mode",
             },
             "paths": {
-                "input",
+                "jsonl_input",
+                "dataset_input",
+                "dataset_config",
+                "dataset_split",
                 "seed_labels",
                 "taxonomy",
                 "discovery_output",
@@ -393,7 +422,10 @@ def _load_config_defaults(parser: argparse.ArgumentParser) -> dict:
             ("model", "dtype"): "dtype",
             ("model", "seed"): "seed",
             ("model", "thinking_mode"): "thinking_mode",
-            ("paths", "input"): "input",
+            ("paths", "jsonl_input"): "jsonl_input",
+            ("paths", "dataset_input"): "dataset_input",
+            ("paths", "dataset_config"): "dataset_config",
+            ("paths", "dataset_split"): "dataset_split",
             ("paths", "seed_labels"): "seed_labels",
             ("paths", "taxonomy"): "taxonomy",
             ("paths", "discovery_output"): "discovery_output",

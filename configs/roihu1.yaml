@@ -18,7 +18,7 @@ model:
   thinking_mode: "disabled"  # disabled, enabled, template-default
 
 paths:
-  input: "/scratch/project_2020507/users/tarkkaot/MultiWebOrganizerPlus/data/FineWebSmallSample.jsonl"
+  jsonl_input: "/scratch/project_2020507/users/tarkkaot/MultiWebOrganizerPlus/data/FineWebSmallSample.jsonl"
   seed_labels: "/scratch/project_2020507/users/tarkkaot/MultiWebOrganizerPlus/configs/seed_labels/topics.yaml"
   taxonomy: "/scratch/project_2020507/users/tarkkaot/MultiWebOrganizerPlus/results/${run_name}/taxonomy_state.json"
   discovery_output: "/scratch/project_2020507/users/tarkkaot/MultiWebOrganizerPlus/results/${run_name}/discovery.jsonl"

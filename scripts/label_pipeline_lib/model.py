@@ -16,6 +16,7 @@ except ImportError:
 
 from label_pipeline_lib.common import LOGGER
 from label_pipeline_lib.prompts import (
+    build_candidate_consolidation_messages,
     build_candidate_promotion_messages,
     build_discovery_messages,
     build_final_merge_messages,
@@ -26,6 +27,7 @@ from label_pipeline_lib.prompts import (
 from label_pipeline_lib.structured_schemas import (
     PromptItem,
     StructuredSchemaSpec,
+    build_candidate_consolidation_output_schema,
     build_candidate_promotion_output_schema,
     build_classification_output_schema,
     build_discovery_output_schema,
@@ -34,6 +36,7 @@ from label_pipeline_lib.structured_schemas import (
     build_proposal_screening_output_schema,
 )
 from label_pipeline_lib.schemas import (
+    CandidateConsolidationOutput,
     CandidatePromotionOutput,
     FinalMergeOutput,
     FinalRevisionOutput,
@@ -510,6 +513,13 @@ class ModelClient:
         )
         valid_ids = {label.id for label in labels}
         for doc, result in zip(docs, results, strict=True):
+            if not result.assigned_label_ids and not result.proposed_labels:
+                LOGGER.warning(
+                    "Document %s: discovery model returned no assigned labels "
+                    "and no proposed labels; preserving document as processed "
+                    "with no discovery evidence",
+                    doc.doc_id,
+                )
             unknown = set(result.assigned_label_ids) - valid_ids
             if unknown:
                 raise ValueError(
@@ -633,6 +643,45 @@ class ModelClient:
             for group in proposal_groups
         ]
         return global_to_local, local_to_global, model_groups
+
+    @staticmethod
+    def _candidate_aliases(
+        candidate_groups: Sequence[ProposalGroup],
+    ) -> tuple[dict[str, str], dict[str, str], list[ProposalGroup]]:
+        global_to_local = {
+            group.group_id: f"C{i:03d}"
+            for i, group in enumerate(candidate_groups, start=1)
+        }
+        local_to_global = {
+            local_id: global_id for global_id, local_id in global_to_local.items()
+        }
+        model_groups = [
+            group.model_copy(update={"group_id": global_to_local[group.group_id]})
+            for group in candidate_groups
+        ]
+        return global_to_local, local_to_global, model_groups
+
+    @staticmethod
+    def _translate_consolidation_ids(
+        result: CandidateConsolidationOutput,
+        local_to_global: dict[str, str],
+    ) -> CandidateConsolidationOutput:
+        translated: dict[str, str] = {}
+        for local_source, local_representative in result.assignments.items():
+            if local_source not in local_to_global:
+                raise ValueError(
+                    "Candidate consolidator returned unknown local source ID "
+                    f"{local_source!r}"
+                )
+            if local_representative not in local_to_global:
+                raise ValueError(
+                    "Candidate consolidator returned unknown local representative ID "
+                    f"{local_representative!r}"
+                )
+            translated[local_to_global[local_source]] = local_to_global[
+                local_representative
+            ]
+        return CandidateConsolidationOutput(assignments=translated)
 
     @staticmethod
     def _translate_screening_ids(
@@ -895,6 +944,85 @@ class ModelClient:
         return self._screen_proposals_resilient(
             state, proposal_groups, aspect, max_tokens=max_tokens
         )
+
+    def consolidate_candidate_batches(
+        self,
+        state: TaxonomyState,
+        candidate_batches: Sequence[Sequence[ProposalGroup]],
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> list[CandidateConsolidationOutput]:
+        """Consolidate independent lexical candidate neighborhoods in one scheduler batch."""
+
+        batches = [list(batch) for batch in candidate_batches]
+        if not batches:
+            return []
+        if any(len(batch) < 2 for batch in batches):
+            raise ValueError(
+                "consolidate_candidate_batches requires at least two candidates per batch"
+            )
+        if not aspect:
+            raise ValueError(
+                "consolidate_candidate_batches requires a non-empty aspect"
+            )
+
+        prompt_budget = self.max_model_len - max_tokens
+        if prompt_budget <= 0:
+            raise ValueError(
+                f"max_tokens={max_tokens} leaves no prompt budget for "
+                f"max_model_len={self.max_model_len}"
+            )
+
+        prompt_items: list[PromptItem] = []
+        schema_specs: list[StructuredSchemaSpec[CandidateConsolidationOutput]] = []
+        translations: list[dict[str, str]] = []
+
+        for batch_index, candidate_groups in enumerate(batches, start=1):
+            _, local_to_global, model_groups = self._candidate_aliases(candidate_groups)
+            messages = build_candidate_consolidation_messages(
+                model_groups, aspect=aspect
+            )
+            prompt_tokens = self._chat_token_count(messages)
+            if prompt_tokens > prompt_budget:
+                raise ValueError(
+                    f"candidate_consolidation:batch_{batch_index}:taxonomy_v"
+                    f"{state.schema_version}: prompt is {prompt_tokens} tokens but "
+                    f"only {prompt_budget} prompt tokens are available. Reduce the "
+                    "candidate-consolidation batch bound or increase --max-model-len."
+                )
+
+            prompt_items.append(
+                PromptItem(
+                    debug_id=(
+                        f"candidate_consolidation:batch_{batch_index}:"
+                        f"taxonomy_v{state.schema_version}"
+                    ),
+                    messages=messages,
+                )
+            )
+            schema_specs.append(
+                build_candidate_consolidation_output_schema(
+                    valid_candidate_group_ids=list(local_to_global)
+                )
+            )
+            translations.append(local_to_global)
+
+        raw_results = self._run_structured_chat(
+            prompt_items,
+            schema_specs=schema_specs,
+            max_tokens=max_tokens,
+        )
+        if len(raw_results) != len(batches):
+            raise RuntimeError(
+                f"Expected {len(batches)} consolidation results, got "
+                f"{len(raw_results)}"
+            )
+
+        return [
+            self._translate_consolidation_ids(result, local_to_global)
+            for result, local_to_global in zip(raw_results, translations, strict=True)
+        ]
 
     def promote_candidates(
         self,

@@ -60,13 +60,13 @@ def start_compute_logger(
     *,
     interval: float,
     num_gpus: int,
-    get_progress: Callable[[], tuple[int, int]],
+    get_progress: Callable[[], tuple[int, int | None]],
     stop_event: threading.Event | None = None,
 ) -> threading.Event:
     """Start a daemon thread that periodically logs elapsed compute and ETA.
 
     ``get_progress`` must return ``(processed_this_run, total_to_process_this_run)``.
-    This distinction matters when resuming a partially completed run.
+    The total may be ``None`` for streamed inputs whose size is unknown.
     """
     if interval <= 0:
         raise ValueError("compute logging interval must be > 0")
@@ -92,9 +92,9 @@ def start_compute_logger(
                 LOGGER.exception("Compute logger: failed to fetch progress: %s", exc)
                 continue
 
-            if processed < 0 or total < 0:
+            if processed < 0 or (total is not None and total < 0):
                 LOGGER.error(
-                    "Compute logger received invalid progress: processed=%d total=%d",
+                    "Compute logger received invalid progress: processed=%d total=%s",
                     processed,
                     total,
                 )
@@ -105,10 +105,10 @@ def start_compute_logger(
                 f"elapsed={format_duration(elapsed)}",
                 f"gpus={num_gpus}",
                 f"gpu-hours-used={gpu_hours_used:.4f}",
-                f"processed={processed}/{total}",
+                f"processed={processed}/{total if total is not None else 'unknown'}",
             ]
 
-            if total > 0 and processed > 0:
+            if total is not None and total > 0 and processed > 0:
                 rate = processed / elapsed if elapsed > 0 else 0.0
                 if rate > 0:
                     remaining = max(0, total - processed)

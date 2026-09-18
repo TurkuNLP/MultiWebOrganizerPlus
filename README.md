@@ -152,7 +152,7 @@ space before submitting a long run. I also recommend setting `VLLM_CACHE_ROOT` t
 		 python scripts/label_pipeline.py \
 			 --config configs/my_run.yaml \
 			 --mode classify \
-			 --input /scratch/project_<id>/users/<user>/MultiWebOrganizerPlus/data/FineWebSample.jsonl \
+			 --jsonl-input /scratch/project_<id>/users/<user>/MultiWebOrganizerPlus/data/FineWebSample.jsonl \
 			 --taxonomy /scratch/project_<id>/users/<user>/MultiWebOrganizerPlus/results/my_run/taxonomy_state.json \
 			 --output /scratch/project_<id>/users/<user>/MultiWebOrganizerPlus/results/my_run/final_labels.jsonl
 	 ```

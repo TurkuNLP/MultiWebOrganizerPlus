@@ -15,9 +15,10 @@ from label_pipeline_lib.common import (
     batch_iter,
     count_jsonl_records,
     file_fingerprint,
+    input_source_name,
     iter_jsonl_models,
     load_model_file,
-    stream_documents,
+    stream_input_documents,
     taxonomy_hash,
     validate_taxonomy_state,
 )
@@ -37,11 +38,14 @@ def metadata_path_for_output(output_path: Path) -> Path:
 
 def build_classification_metadata(
     args: argparse.Namespace,
-    input_path: Path,
+    input_source: str,
     taxonomy_path: Path,
     state: TaxonomyState,
 ) -> ClassificationRunMetadata:
-    resolved, size, mtime_ns = file_fingerprint(input_path)
+    if args.jsonl_input:
+        resolved, size, mtime_ns = file_fingerprint(Path(args.jsonl_input))
+    else:
+        resolved, size, mtime_ns = input_source, 0, 0
     return ClassificationRunMetadata(
         input_path=resolved,
         input_size_bytes=size,
@@ -100,7 +104,6 @@ def load_result_index(path: Path, model_type: type) -> tuple[set[str], int]:
 
 
 def run_classification(args: argparse.Namespace) -> None:
-    input_path = Path(args.input)
     taxonomy_path = Path(args.taxonomy)
     output_path = Path(args.output)
     meta_path = metadata_path_for_output(output_path)
@@ -123,7 +126,9 @@ def run_classification(args: argparse.Namespace) -> None:
             f"{meta_path}. Use --overwrite-output for a fresh run."
         )
 
-    metadata = build_classification_metadata(args, input_path, taxonomy_path, state)
+    metadata = build_classification_metadata(
+        args, input_source_name(args), taxonomy_path, state
+    )
     ensure_classification_metadata(meta_path, metadata)
 
     completed_ids, last_seq = load_result_index(output_path, FinalClassificationRecord)
@@ -156,20 +161,36 @@ def run_classification(args: argparse.Namespace) -> None:
     seen_input_ids: set[str] = set()
     next_seq = last_seq + 1
     processed_this_run = 0
-    total_input = count_jsonl_records(input_path)
-    if len(completed_ids) > total_input:
+    # Total input documents is only known if a JSONL input file is provided.
+    # This is because streaming from HF is slow in comparison.
+    total_input = (
+        count_jsonl_records(Path(args.jsonl_input)) if args.jsonl_input else None
+    )
+    if total_input is not None and len(completed_ids) > total_input:
         raise ValueError(
             f"Classification output contains {len(completed_ids)} records but input "
             f"contains only {total_input} documents"
         )
-    total_pending = total_input - len(completed_ids)
+    total_pending = (
+        total_input - len(completed_ids) if total_input is not None else None
+    )
+    remaining_documents = None
+    if args.max_documents is not None:
+        remaining_documents = max(args.max_documents - len(completed_ids), 0)
+        if total_pending is not None:
+            total_pending = min(total_pending, remaining_documents)
+        else:
+            # If dataset size is unknown, we assume max_documents is the upper bound for progress logging.
+            total_pending = remaining_documents
 
     # Optionally start compute logger. ETA is based on work remaining in this run,
     # not the full corpus size, so resumed runs report meaningful estimates.
     stop_event = None
-    if getattr(args, "compute_logging", False) and total_pending > 0:
+    if getattr(args, "compute_logging", False) and (
+        total_pending is None or total_pending > 0
+    ):
 
-        def _get_progress() -> tuple[int, int]:
+        def _get_progress() -> tuple[int, int | None]:
             return processed_this_run, total_pending
 
         stop_event = start_compute_logger(
@@ -181,12 +202,19 @@ def run_classification(args: argparse.Namespace) -> None:
     try:
 
         def pending_docs() -> Iterator[InputDocument]:
-            for doc in stream_documents(input_path):
+            yielded = 0
+            documents = iter(stream_input_documents(args))
+            while remaining_documents is None or yielded < remaining_documents:
+                try:
+                    doc = next(documents)
+                except StopIteration:
+                    break
                 if doc.doc_id in seen_input_ids:
                     raise ValueError(f"Duplicate doc_id {doc.doc_id!r} in input corpus")
                 seen_input_ids.add(doc.doc_id)
                 if doc.doc_id in completed_ids:
                     continue
+                yielded += 1
                 yield doc
 
         for batch in batch_iter(pending_docs(), args.batch_size):
@@ -233,7 +261,7 @@ def run_classification(args: argparse.Namespace) -> None:
         raise ValueError("Input corpus contains no documents")
 
     missing_completed = completed_ids - seen_input_ids
-    if missing_completed:
+    if args.max_documents is None and missing_completed:
         raise ValueError(
             "Classification output contains document IDs absent from the input corpus: "
             f"{sorted(missing_completed)[:10]}"

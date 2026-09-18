@@ -41,4 +41,4 @@ mkdir -p "$VLLM_CACHE_ROOT"
 srun singularity run -B /scratch/project_462001516 "$SIF" python "$python_script" \
                         --config "$base_dir/configs/creative2.yaml" \
                         --mode discover \
-                        --input "$base_dir/data/FineWebSmallSample.jsonl" \
+                        --jsonl-input "$base_dir/data/FineWebSmallSample.jsonl" \

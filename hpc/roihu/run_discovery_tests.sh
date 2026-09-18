@@ -1,21 +1,26 @@
 #!/bin/bash
-#SBATCH --job-name=discover_topic_labels
+#SBATCH --job-name=tests
 #SBATCH --account=project_2020507
-#SBATCH --partition=gpumedium
-#SBATCH --time=01:00:00
+#SBATCH --partition=gputest
+#SBATCH --time=00:15:00
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1 --cpus-per-task=144
-#SBATCH --gres=gpu:gh200:2
-#SBATCH --mem=434172
-#SBATCH -o ../logs/discover_%j.out
-#SBATCH -e ../logs/discover_%j.err
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --gres=gpu:gh200:1
+#SBATCH --output=../logs/tests_%j.out
+#SBATCH --error=../logs/tests_%j.err
+
+set -euo pipefail
 
 module purge
 module load python-vllm/0.19.1
 
 # Set the number of CPU threads based on cpus-per-task
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
-export NUMEXPR_MAX_THREADS=64
+
+# Unset CC and CXX to avoid conflicts with the Singularity container's compilers.
+#unset CC CXX
 
 # Keep expected third-party startup warnings out of the SLURM error log.
 export PYTHONWARNINGS="ignore::FutureWarning"
@@ -27,16 +32,11 @@ export HF_DATASETS_CACHE="$HF_HOME/datasets"
 export HF_HUB_CACHE="$HF_HOME/hub"
 mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$HF_HUB_CACHE"
 
-# Define paths to the base directory and Python script.
+# Define paths to the base directory, Singularity image, and Python script.
 base_dir="/scratch/project_2020507/users/tarkkaot/MultiWebOrganizerPlus"
-python_script="$base_dir/scripts/label_pipeline.py"
 
 # Set vLLM cache root to a directory in the scratch space
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$base_dir/cache/vllm}"
 mkdir -p "$VLLM_CACHE_ROOT"
 
-srun python "$python_script" \
-                        --config "$base_dir/configs/roihu3.yaml" \
-                        --mode discover \
-                        --max-documents 100000
-                        
+srun python -m pytest -q "$base_dir/scripts/tests/test_label_pipeline.py"

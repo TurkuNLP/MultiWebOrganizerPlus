@@ -11,7 +11,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 
 # The orchestration module imports vLLM at module import time. These tests exercise
@@ -38,24 +38,35 @@ from label_pipeline_lib.common import (  # noqa: E402
     configure_logging,
     load_model_file,
     seed_labels_hash,
+    stream_documents,
     validate_taxonomy_state,
 )
 from label_pipeline_lib.compute_logger import detect_num_gpus  # noqa: E402
-from label_pipeline_lib.model import ModelClient, StructuredModelOutputError  # noqa: E402
+from label_pipeline_lib.model import (
+    ModelClient,
+    StructuredModelOutputError,
+)  # noqa: E402
 from label_pipeline_lib.discovery import (  # noqa: E402
     accumulate_existing_candidate_support,
+    apply_candidate_consolidation,
+    build_candidate_consolidation_batches,
+    candidate_name_similarity,
+    consolidate_candidate_pool,
+    reviewed_candidate_non_equivalence_pairs,
     apply_candidate_promotion,
     apply_final_merge,
     apply_final_revision,
     apply_proposal_screening,
     run_final_maintenance,
     screen_new_proposals,
+    validate_candidate_consolidation_semantics,
     validate_candidate_promotion_semantics,
     validate_final_merge_semantics,
     validate_final_revision_semantics,
     validate_proposal_screening_semantics,
 )
 from label_pipeline_lib.schemas import (  # noqa: E402
+    CandidateConsolidationOutput,
     CandidatePromotionOutput,
     DiscardCandidateDecision,
     DiscoveryRecord,
@@ -79,9 +90,13 @@ from label_pipeline_lib.schemas import (  # noqa: E402
     TaxonomyState,
 )
 from label_pipeline_lib.structured_schemas import (  # noqa: E402
+    build_candidate_consolidation_output_schema,
     build_proposal_screening_output_schema,
 )
-from label_pipeline_lib.prompts import build_proposal_screening_messages  # noqa: E402
+from label_pipeline_lib.prompts import (  # noqa: E402
+    build_candidate_consolidation_messages,
+    build_proposal_screening_messages,
+)
 
 
 def make_state() -> TaxonomyState:
@@ -497,7 +512,6 @@ def test_screening_prompt_describes_keyed_output_and_aspect() -> None:
     assert "P001" in system
 
 
-
 def _make_screening_groups(count: int) -> list[ProposalGroup]:
     return [
         ProposalGroup(
@@ -637,6 +651,7 @@ def test_model_screening_singleton_failure_falls_back_to_keep_candidate(
     assert result.decisions[0].proposal_group_id == "G1"
     assert "RECOVERY: singleton proposal screening remained malformed" in caplog.text
     assert "No malformed model decision was accepted" in caplog.text
+
 
 def _make_screening_groups(count: int) -> list[ProposalGroup]:
     return [
@@ -800,7 +815,7 @@ def test_classification_rejects_zero_max_assigned_labels() -> None:
         [
             "--mode",
             "classify",
-            "--input",
+            "--jsonl-input",
             "/tmp/input.jsonl",
             "--max-assigned-labels-per-doc",
             "0",
@@ -815,6 +830,54 @@ def test_input_document_rejects_blank_core_fields() -> None:
         InputDocument(doc_id="   ", text="valid")
     with pytest.raises(ValidationError, match="text must not be blank"):
         InputDocument(doc_id="doc-1", text="\n\t  ")
+
+
+def test_jsonl_input_accepts_document_id_aliases(tmp_path: Path) -> None:
+    input_path = tmp_path / "aliases.jsonl"
+    rows = [
+        {"doc_id": "direct", "text": "first"},
+        {"id": "generic", "text": "second"},
+        {"warc_record_id": "warc", "text": "third"},
+    ]
+    input_path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+    documents = list(stream_documents(input_path))
+
+    assert [document.doc_id for document in documents] == [
+        "direct",
+        "generic",
+        "warc",
+    ]
+
+
+def test_jsonl_input_prefers_doc_id_over_aliases(tmp_path: Path) -> None:
+    input_path = tmp_path / "precedence.jsonl"
+    input_path.write_text(
+        json.dumps(
+            {
+                "doc_id": "direct",
+                "id": "generic",
+                "warc_record_id": "warc",
+                "text": "document",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    documents = list(stream_documents(input_path))
+
+    assert documents[0].doc_id == "direct"
+
+
+def test_jsonl_input_requires_a_document_id(tmp_path: Path) -> None:
+    input_path = tmp_path / "missing-id.jsonl"
+    input_path.write_text(json.dumps({"text": "document"}) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="doc_id"):
+        list(stream_documents(input_path))
 
 
 class _KeepAllScreeningModel:
@@ -1060,15 +1123,36 @@ def test_taxonomy_rejects_invalid_dynamic_version_metadata() -> None:
 def test_cli_rejects_negative_seed_for_reproducibility() -> None:
     parser = build_arg_parser()
     args = parser.parse_args(
-        ["--mode", "classify", "--input", "/tmp/input.jsonl", "--seed", "-1"]
+        ["--mode", "classify", "--jsonl-input", "/tmp/input.jsonl", "--seed", "-1"]
     )
     with pytest.raises(ValueError, match="seed"):
         validate_cli_args(args)
 
 
+def test_cli_accepts_and_validates_max_documents() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--mode",
+            "classify",
+            "--jsonl-input",
+            "/tmp/input.jsonl",
+            "--max-documents",
+            "3",
+        ]
+    )
+    validate_cli_args(args)
+
+    args.max_documents = 0
+    with pytest.raises(ValueError, match="max-documents"):
+        validate_cli_args(args)
+
+
 def test_cli_rejects_non_boolean_config_style_runtime_values() -> None:
     parser = build_arg_parser()
-    args = parser.parse_args(["--mode", "classify", "--input", "/tmp/input.jsonl"])
+    args = parser.parse_args(
+        ["--mode", "classify", "--jsonl-input", "/tmp/input.jsonl"]
+    )
     args.compute_logging = "false"
     with pytest.raises(ValueError, match="compute-logging"):
         validate_cli_args(args)
@@ -1079,10 +1163,36 @@ def test_discovery_output_rejects_duplicate_proposal_evidence() -> None:
         '{"assigned_label_ids":[],"proposed_labels":['
         '{"name":"Quantum Computing","definition":"Documents about quantum computing."},'
         '{"name":" quantum   computing ","definition":"Documents about quantum computing."}'
-        ']}'
+        "]}"
     )
     with pytest.raises(ValidationError, match="duplicate normalized"):
         LabellingOutputSchema.model_validate_json(payload)
+
+
+def test_empty_discovery_output_is_logged_and_accepted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = ModelClient.__new__(ModelClient)
+    client.fit_document_messages = lambda **kwargs: []  # type: ignore[method-assign]
+    client._run_structured_chat = lambda *args, **kwargs: [  # type: ignore[method-assign]
+        LabellingOutputSchema(assigned_label_ids=[], proposed_labels=[])
+    ]
+
+    with caplog.at_level("WARNING"):
+        outputs = client.discover_batch(
+            [InputDocument(doc_id="doc-empty", text="Document text.")],
+            [LabelDef(id="L001", name="Seed", definition="A seed label.")],
+            aspect="topics",
+            creativity="low",
+            max_document_tokens=128,
+            output_max_tokens=64,
+            max_assigned_labels_per_doc=2,
+            max_proposals_per_doc=2,
+        )
+
+    assert outputs == [LabellingOutputSchema(assigned_label_ids=[], proposed_labels=[])]
+    assert "doc-empty" in caplog.text
+    assert "no assigned labels and no proposed labels" in caplog.text
 
 
 def test_persisted_records_reject_duplicate_assignments_and_proposals() -> None:
@@ -1308,8 +1418,7 @@ class _EndToEndClassificationModel:
         **kwargs: object,
     ) -> list[FrozenClassificationOutputSchema]:
         return [
-            FrozenClassificationOutputSchema(assigned_label_ids=["L001"])
-            for _ in docs
+            FrozenClassificationOutputSchema(assigned_label_ids=["L001"]) for _ in docs
         ]
 
 
@@ -1352,7 +1461,7 @@ def test_end_to_end_discovery_freeze_and_classification_resume(
         [
             "--mode",
             "discover",
-            "--input",
+            "--jsonl-input",
             str(input_path),
             "--seed-labels",
             str(seed_path),
@@ -1400,7 +1509,7 @@ def test_end_to_end_discovery_freeze_and_classification_resume(
         [
             "--mode",
             "classify",
-            "--input",
+            "--jsonl-input",
             str(input_path),
             "--taxonomy",
             str(taxonomy_path),
@@ -1413,14 +1522,18 @@ def test_end_to_end_discovery_freeze_and_classification_resume(
         ]
     )
     validate_cli_args(classify_args)
-    monkeypatch.setattr(classification_module, "ModelClient", _EndToEndClassificationModel)
+    monkeypatch.setattr(
+        classification_module, "ModelClient", _EndToEndClassificationModel
+    )
     classification_module.run_classification(classify_args)
 
     final_records = list(
         classification_module.iter_jsonl_models(final_path, FinalClassificationRecord)
     )
     assert len(final_records) == 4
-    assert all(record.taxonomy_hash == state.frozen_taxonomy_hash for record in final_records)
+    assert all(
+        record.taxonomy_hash == state.frozen_taxonomy_hash for record in final_records
+    )
 
     # Running the same frozen classification again must resume cleanly without
     # duplicating already-persisted records.
@@ -1429,3 +1542,339 @@ def test_end_to_end_discovery_freeze_and_classification_resume(
         classification_module.iter_jsonl_models(final_path, FinalClassificationRecord)
     )
     assert final_records_after_resume == final_records
+
+
+# ---------------------------------------------------------------------------
+# Candidate semantic consolidation
+# ---------------------------------------------------------------------------
+
+
+def _candidate(group_id: str, name: str, definition: str, support: int = 1) -> ProposalGroup:
+    return ProposalGroup(
+        group_id=group_id,
+        name=name,
+        definition=definition,
+        support_count=support,
+    )
+
+
+def test_old_format_v3_settings_load_candidate_consolidation_defaults() -> None:
+    payload = make_state().model_dump(mode="json")
+    settings = payload["discovery_settings"]
+    settings.pop("candidate_consolidation_max_groups")
+    settings.pop("candidate_consolidation_min_name_similarity")
+    settings.pop("candidate_consolidation_max_tokens")
+
+    loaded = TaxonomyState.model_validate(payload)
+    assert loaded.discovery_settings.candidate_consolidation_max_groups == 12
+    assert loaded.discovery_settings.candidate_consolidation_min_name_similarity == 0.80
+    assert loaded.discovery_settings.candidate_consolidation_max_tokens == 512
+
+
+def test_candidate_name_similarity_retrieves_media_journalism_variants() -> None:
+    groups = [
+        _candidate(
+            "G1",
+            "Media Ethics & Journalism",
+            "Content concerning standards and controversies within journalism.",
+        ),
+        _candidate(
+            "G2",
+            "Media & Journalism",
+            "Content related to the news industry and journalism practice.",
+        ),
+        _candidate(
+            "G3",
+            "Media & Journalism",
+            "Content related to news media and publishing.",
+        ),
+        _candidate(
+            "G4",
+            "Journalism & Media",
+            "Content related to news reporting and media production.",
+        ),
+    ]
+
+    for left_index, left in enumerate(groups):
+        for right in groups[left_index + 1 :]:
+            assert candidate_name_similarity(left, right) >= 0.80
+
+    batches = build_candidate_consolidation_batches(groups)
+    assert [[group.group_id for group in batch] for batch in batches] == [
+        ["G1", "G2", "G3", "G4"]
+    ]
+
+
+def test_candidate_consolidation_batches_do_not_follow_similarity_chains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    groups = [
+        _candidate("G1", "Alpha Shared", "Definition one."),
+        _candidate("G2", "Beta Shared", "Definition two."),
+        _candidate("G3", "Gamma Shared", "Definition three."),
+    ]
+    scores = {
+        frozenset({"G1", "G2"}): 0.90,
+        frozenset({"G2", "G3"}): 0.90,
+        frozenset({"G1", "G3"}): 0.40,
+    }
+
+    def fake_similarity(left: ProposalGroup, right: ProposalGroup) -> float:
+        return scores[frozenset({left.group_id, right.group_id})]
+
+    monkeypatch.setattr(discovery_module, "candidate_name_similarity", fake_similarity)
+    batches = build_candidate_consolidation_batches(groups, min_similarity=0.80)
+    assert [[group.group_id for group in batch] for batch in batches] == [
+        ["G1", "G2"]
+    ]
+
+
+def test_candidate_consolidation_schema_is_exact_and_keyed() -> None:
+    spec = build_candidate_consolidation_output_schema(["C001", "C002", "C003"])
+    assignments = spec.json_schema["properties"]["assignments"]
+
+    assert assignments["required"] == ["C001", "C002", "C003"]
+    assert assignments["additionalProperties"] is False
+    assert assignments["properties"]["C001"]["enum"] == [
+        "C001",
+        "C002",
+        "C003",
+    ]
+
+    valid = spec.model_type.model_validate(
+        {
+            "assignments": {
+                "C001": "C002",
+                "C002": "C002",
+                "C003": "C003",
+            }
+        }
+    )
+    assert valid.assignments["C001"] == "C002"
+
+    with pytest.raises(ValidationError, match="coverage mismatch"):
+        spec.model_type.model_validate(
+            {"assignments": {"C001": "C001", "C002": "C002"}}
+        )
+
+    with pytest.raises(ValidationError, match="unknown representative"):
+        spec.model_type.model_validate(
+            {
+                "assignments": {
+                    "C001": "C999",
+                    "C002": "C002",
+                    "C003": "C003",
+                }
+            }
+        )
+
+
+def test_candidate_consolidation_semantics_require_self_mapped_representatives() -> None:
+    groups = [
+        _candidate("G1", "Media Journalism", "Definition one."),
+        _candidate("G2", "Journalism Media", "Definition two."),
+        _candidate("G3", "News Media", "Definition three."),
+    ]
+    result = CandidateConsolidationOutput(
+        assignments={"G1": "G2", "G2": "G3", "G3": "G3"}
+    )
+    with pytest.raises(ValueError, match="representatives must map to themselves"):
+        validate_candidate_consolidation_semantics(groups, result)
+
+
+def test_candidate_consolidation_sums_support_into_existing_representative() -> None:
+    g1 = _candidate(
+        "G1",
+        "Media Ethics & Journalism",
+        "Content concerning ethics within journalism.",
+        1,
+    )
+    g2 = _candidate(
+        "G2",
+        "Media & Journalism",
+        "Content related to the news industry and journalism.",
+        2,
+    )
+    unrelated = _candidate(
+        "G3",
+        "Quantum Computing",
+        "Content related to quantum computing.",
+        1,
+    )
+    state = make_state().model_copy(
+        update={"candidate_proposals": [g1, g2, unrelated]}
+    )
+    result = CandidateConsolidationOutput(assignments={"G1": "G2", "G2": "G2"})
+
+    updated = apply_candidate_consolidation(
+        state,
+        [g1, g2],
+        result,
+        max_total_labels=100,
+    )
+
+    by_id = {group.group_id: group for group in updated.candidate_proposals}
+    assert "G1" not in by_id
+    assert by_id["G2"].support_count == 3
+    assert by_id["G2"].name == g2.name
+    assert by_id["G2"].definition == g2.definition
+    assert by_id["G3"] == unrelated
+    assert updated.schema_version == state.schema_version
+    assert updated.history[-1].kind == "candidate_consolidation"
+    round_tripped = TaxonomyState.model_validate(updated.model_dump(mode="json"))
+    assert round_tripped.history[-1].kind == "candidate_consolidation"
+
+
+def test_distinct_candidate_judgment_is_cached_for_future_blocking() -> None:
+    g1 = _candidate(
+        "G1", "Media & Journalism", "Content related to media and journalism.", 1
+    )
+    g2 = _candidate(
+        "G2", "Journalism & Media", "Content related to journalism and media.", 1
+    )
+    state = make_state().model_copy(update={"candidate_proposals": [g1, g2]})
+    distinct = CandidateConsolidationOutput(assignments={"G1": "G1", "G2": "G2"})
+
+    reviewed = apply_candidate_consolidation(
+        state,
+        [g1, g2],
+        distinct,
+        max_total_labels=100,
+    )
+    excluded = reviewed_candidate_non_equivalence_pairs(reviewed)
+    assert frozenset({"G1", "G2"}) in excluded
+    assert build_candidate_consolidation_batches(
+        reviewed.candidate_proposals,
+        excluded_pairs=excluded,
+    ) == []
+
+
+def test_candidate_consolidation_can_raise_combined_support_above_promotion_threshold() -> None:
+    g1 = _candidate(
+        "G1",
+        "Media & Journalism",
+        "Content related to media and journalism.",
+        1,
+    )
+    g2 = _candidate(
+        "G2",
+        "Journalism & Media",
+        "Content related to journalism and media.",
+        1,
+    )
+    state = make_state().model_copy(update={"candidate_proposals": [g1, g2]})
+    result = CandidateConsolidationOutput(assignments={"G1": "G1", "G2": "G1"})
+
+    updated = apply_candidate_consolidation(
+        state,
+        [g1, g2],
+        result,
+        max_total_labels=100,
+    )
+    assert len(updated.candidate_proposals) == 1
+    consolidated = updated.candidate_proposals[0]
+    assert consolidated.support_count == 2
+
+    promotion = CandidatePromotionOutput(
+        new_labels=[
+            PromotedCandidateLabel(
+                candidate_group_ids=[consolidated.group_id],
+                name="Media and Journalism",
+                definition="Content centrally concerned with media and journalism.",
+            )
+        ]
+    )
+    validate_candidate_promotion_semantics(
+        updated,
+        [consolidated],
+        promotion,
+        min_promotion_support=2,
+        max_new_labels=1,
+        max_total_labels=100,
+    )
+
+
+def test_candidate_consolidation_prompt_explains_lexical_block_is_not_merge_evidence() -> None:
+    messages = build_candidate_consolidation_messages(
+        [
+            _candidate("C001", "Media Journalism", "Definition one."),
+            _candidate("C002", "Journalism Media", "Definition two."),
+        ],
+        aspect="topics",
+    )
+    system = messages[0]["content"]
+    assert "NOT evidence" in system
+    assert "overlapping" in system
+    assert "representative candidate must map to itself" in system
+    assert "Python sums support deterministically" in system
+
+
+class _MalformedConsolidationModel:
+    def consolidate_candidate_batches(
+        self,
+        state: TaxonomyState,
+        candidate_batches: list[list[ProposalGroup]],
+        aspect: str,
+        *,
+        max_tokens: int,
+    ) -> list[CandidateConsolidationOutput]:
+        raise StructuredModelOutputError("synthetic malformed consolidation")
+
+
+def test_malformed_candidate_consolidation_is_skipped_without_crashing(
+    tmp_path: Path,
+) -> None:
+    g1 = _candidate(
+        "G1", "Media & Journalism", "Content related to media and journalism.", 1
+    )
+    g2 = _candidate(
+        "G2", "Journalism & Media", "Content related to journalism and media.", 1
+    )
+    state = make_state().model_copy(update={"candidate_proposals": [g1, g2]})
+
+    updated = consolidate_candidate_pool(
+        model=_MalformedConsolidationModel(),  # type: ignore[arg-type]
+        state=state,
+        aspect="topics",
+        taxonomy_path=tmp_path / "taxonomy.json",
+        max_total_labels=100,
+        min_promotion_support=2,
+        maintenance_max_tokens=4096,
+    )
+    assert updated == state
+
+
+def test_model_candidate_consolidation_translates_local_ids_back_to_global() -> None:
+    g1 = _candidate(
+        "G_alpha", "Media & Journalism", "Content related to media and journalism.", 1
+    )
+    g2 = _candidate(
+        "G_beta", "Journalism & Media", "Content related to journalism and media.", 1
+    )
+    client = object.__new__(ModelClient)
+    client.max_model_len = 32768
+    client._chat_token_count = lambda messages: 100  # type: ignore[method-assign]
+
+    def fake_run(prompt_items, *, schema_spec=None, schema_specs=None, max_tokens):
+        assert schema_spec is None
+        assert schema_specs is not None
+        assert len(prompt_items) == 1
+        assert len(schema_specs) == 1
+        return [
+            schema_specs[0].model_type.model_validate(
+                {"assignments": {"C001": "C002", "C002": "C002"}}
+            )
+        ]
+
+    client._run_structured_chat = fake_run  # type: ignore[method-assign]
+    result = client.consolidate_candidate_batches(
+        make_state(),
+        [[g1, g2]],
+        "topics",
+        max_tokens=512,
+    )
+    assert result == [
+        CandidateConsolidationOutput(
+            assignments={"G_alpha": "G_beta", "G_beta": "G_beta"}
+        )
+    ]

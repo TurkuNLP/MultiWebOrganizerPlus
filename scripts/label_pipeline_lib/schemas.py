@@ -78,10 +78,14 @@ class LabellingOutputSchema(StrictModel):
 
     @model_validator(mode="after")
     def validate_output(self) -> "LabellingOutputSchema":
-        if not self.assigned_label_ids and not self.proposed_labels:
-            raise ValueError(
-                "At least one assigned label or proposed label is required"
-            )
+
+        # Removed the check for at least one assigned or proposed label,
+        # as it may crash the application on rare occasions.
+        # Instead, empty output will be logged as warning
+        # if not self.assigned_label_ids and not self.proposed_labels:
+        #    raise ValueError(
+        #        "At least one assigned label or proposed label is required"
+        #    )
         signatures = [_proposal_signature(label) for label in self.proposed_labels]
         if len(signatures) != len(set(signatures)):
             raise ValueError(
@@ -122,10 +126,10 @@ class DiscoveryRecord(StrictModel):
             raise ValueError(
                 "proposed_labels contains duplicate normalized name/definition pairs"
             )
-        if not self.assigned_label_ids and not self.proposed_labels:
-            raise ValueError(
-                "DiscoveryRecord must contain at least one assigned or proposed label"
-            )
+        # if not self.assigned_label_ids and not self.proposed_labels:
+        #    raise ValueError(
+        #        "DiscoveryRecord must contain at least one assigned or proposed label"
+        #    )
         return self
 
 
@@ -208,7 +212,30 @@ class ProposalScreeningOutput(StrictModel):
 
 
 # ---------------------------------------------------------------------------
-# 2. Candidate promotion
+# 2. Candidate consolidation
+# ---------------------------------------------------------------------------
+
+
+class CandidateConsolidationOutput(StrictModel):
+    """Partition a bounded candidate neighborhood by representative candidate ID.
+
+    ``assignments`` maps every supplied candidate group to exactly one representative
+    candidate from the same model call. Exact coverage and representative consistency
+    depend on the caller-supplied candidate set and are therefore validated at the
+    model/application boundary rather than in this static schema.
+    """
+
+    assignments: dict[str, str]
+
+    @model_validator(mode="after")
+    def assignments_must_not_be_empty(self) -> "CandidateConsolidationOutput":
+        if not self.assignments:
+            raise ValueError("candidate consolidation assignments must not be empty")
+        return self
+
+
+# ---------------------------------------------------------------------------
+# 3. Candidate promotion
 # ---------------------------------------------------------------------------
 
 
@@ -253,7 +280,7 @@ class CandidatePromotionOutput(StrictModel):
 
 
 # ---------------------------------------------------------------------------
-# 3. Final merge pass
+# 4. Final merge pass
 # ---------------------------------------------------------------------------
 
 
@@ -282,7 +309,7 @@ class FinalMergeOutput(StrictModel):
 
 
 # ---------------------------------------------------------------------------
-# 4. Final revision pass
+# 5. Final revision pass
 # ---------------------------------------------------------------------------
 
 
@@ -344,6 +371,14 @@ class DiscoverySettings(StrictModel):
     max_total_labels: int = Field(ge=1)
     expected_seed_label_count: int = Field(ge=1)
     creativity: Literal["low", "high"] = "low"
+    # Candidate-consolidation defaults are persisted in taxonomy state so a resumed
+    # run records the lexical blocking policy even though no new CLI flags are
+    # required. Existing format-v3 states load these defaults compatibly.
+    candidate_consolidation_max_groups: int = Field(default=12, ge=2)
+    candidate_consolidation_min_name_similarity: float = Field(
+        default=0.80, ge=0.0, le=1.0
+    )
+    candidate_consolidation_max_tokens: int = Field(default=512, ge=1)
 
 
 class ProposalScreeningHistoryEntry(StrictModel):
@@ -353,6 +388,16 @@ class ProposalScreeningHistoryEntry(StrictModel):
     taxonomy_version: int = Field(ge=1)
     proposal_groups: list[ProposalGroup]
     screening: ProposalScreeningOutput
+
+
+class CandidateConsolidationHistoryEntry(StrictModel):
+    kind: Literal["candidate_consolidation"] = "candidate_consolidation"
+    timestamp_unix: int = Field(ge=0)
+    discovery_seq_end: int = Field(ge=0)
+    taxonomy_version: int = Field(ge=1)
+    candidate_groups: list[ProposalGroup]
+    consolidation: CandidateConsolidationOutput
+    resulting_groups: list[ProposalGroup]
 
 
 class CandidatePromotionHistoryEntry(StrictModel):
@@ -384,6 +429,7 @@ class FinalRevisionHistoryEntry(StrictModel):
 
 MaintenanceHistoryEntry = Annotated[
     ProposalScreeningHistoryEntry
+    | CandidateConsolidationHistoryEntry
     | CandidatePromotionHistoryEntry
     | FinalMergeHistoryEntry
     | FinalRevisionHistoryEntry,

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import time
 from collections import Counter
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterator, Sequence
 
@@ -24,14 +26,17 @@ from label_pipeline_lib.common import (
     normalize_text,
     resolve_alias,
     seed_labels_hash,
-    stream_documents,
+    input_source_name,
+    stream_input_documents,
     taxonomy_hash,
     validate_taxonomy_state,
     validate_unique_labels,
 )
 from label_pipeline_lib.compute_logger import detect_num_gpus, start_compute_logger
-from label_pipeline_lib.model import ModelClient
+from label_pipeline_lib.model import ModelClient, StructuredModelOutputError
 from label_pipeline_lib.schemas import (
+    CandidateConsolidationHistoryEntry,
+    CandidateConsolidationOutput,
     CandidatePromotionHistoryEntry,
     CandidatePromotionOutput,
     DiscoveryRecord,
@@ -48,6 +53,27 @@ from label_pipeline_lib.schemas import (
     ProposalScreeningOutput,
     ProposedLabelRecord,
     TaxonomyState,
+)
+
+# Candidate consolidation is intentionally bounded and dependency-free. The lexical
+# stage is only a high-recall blocker: it decides which small neighborhoods the LLM
+# should compare, never whether candidates are actually equivalent.
+CANDIDATE_CONSOLIDATION_MAX_GROUPS = 12
+CANDIDATE_CONSOLIDATION_MIN_NAME_SIMILARITY = 0.80
+_CANDIDATE_NAME_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "for",
+        "in",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "with",
+    }
 )
 
 
@@ -215,6 +241,370 @@ def accumulate_existing_candidate_support(
         ),
         groups_to_screen,
     )
+
+
+def _candidate_name_tokens(value: str) -> tuple[str, ...]:
+    normalized = value.casefold().replace("&", " and ")
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return tuple(
+        sorted(
+            {
+                token
+                for token in normalized.split()
+                if token and token not in _CANDIDATE_NAME_STOPWORDS
+            }
+        )
+    )
+
+
+def candidate_name_similarity(left: ProposalGroup, right: ProposalGroup) -> float:
+    """Cheap lexical similarity used only to retrieve plausible LLM comparisons.
+
+    The score is deliberately name-focused, ignoring the definition. Exact normalized names score 1.0. For
+    variants with reordered or additional words, we compare sorted informative
+    tokens and also use a token-overlap coefficient when at least two informative
+    tokens are shared. The LLM still decides semantic equivalence.
+    """
+
+    # Exact normalized names get similarity 1.0
+    left_name = normalize_text(left.name).replace("&", " and ")
+    right_name = normalize_text(right.name).replace("&", " and ")
+    if left_name == right_name:
+        return 1.0
+
+    # Cheap, white-space tokenization and stopword removal.
+    # Tokens returned in alphabetical order so that reordering does not affect the sequence score.
+    left_tokens = _candidate_name_tokens(left.name)
+    right_tokens = _candidate_name_tokens(right.name)
+    if not left_tokens or not right_tokens:
+        # Character-level similarity if there are no informative tokens
+        return SequenceMatcher(None, left_name, right_name).ratio()
+
+    left_set = set(left_tokens)
+    right_set = set(right_tokens)
+    shared = left_set & right_set # Overlap between the two sets of tokens
+
+    sorted_left = " ".join(left_tokens)
+    sorted_right = " ".join(right_tokens)
+    sequence_score = SequenceMatcher(None, sorted_left, sorted_right).ratio()
+
+    overlap_score = 0.0
+    if len(shared) >= 2:
+        # num shared tokens / min(num tokens in left, num tokens in right)
+        overlap_score = len(shared) / min(len(left_set), len(right_set))
+
+    # Return whichever score is higher:
+    # - Sequence score captures similarity in token order and structure.
+    # - Overlap score captures similarity in token content, especially when there are multiple shared tokens.
+    return max(sequence_score, overlap_score)
+
+
+def build_candidate_consolidation_batches(
+    candidate_groups: Sequence[ProposalGroup],
+    *,
+    max_group_size: int = CANDIDATE_CONSOLIDATION_MAX_GROUPS,
+    min_similarity: float = CANDIDATE_CONSOLIDATION_MIN_NAME_SIMILARITY,
+    excluded_pairs: set[frozenset[str]] | None = None,
+) -> list[list[ProposalGroup]]:
+    """Build small, disjoint, pairwise-similar LLM neighborhoods.
+
+    This intentionally avoids plain graph connected components. A similarity chain
+    A~B and B~C must not automatically place A/B/C in one prompt when A and C are
+    lexically dissimilar. Candidates are added to a neighborhood only when they meet
+    the lexical threshold against every candidate already in that neighborhood.
+    """
+
+    if max_group_size < 2:
+        raise ValueError("max_group_size must be >= 2")
+    if not 0.0 <= min_similarity <= 1.0:
+        raise ValueError("min_similarity must be between 0 and 1")
+
+    excluded = excluded_pairs or set()
+    ordered = sorted(candidate_groups, key=lambda group: group.group_id)
+    ids = [group.group_id for group in ordered]
+    if len(ids) != len(set(ids)):
+        raise ValueError("candidate_groups contains duplicate group IDs")
+
+    by_id = {group.group_id: group for group in ordered}
+    tokens_by_id = {
+        group.group_id: set(_candidate_name_tokens(group.name)) for group in ordered
+    }
+    token_index: dict[str, set[str]] = {}
+    for group_id, tokens in tokens_by_id.items():
+        for token in tokens:
+            token_index.setdefault(token, set()).add(group_id)
+
+    score_cache: dict[tuple[str, str], float] = {}
+
+    def score(left: ProposalGroup, right: ProposalGroup) -> float:
+        key = tuple(sorted((left.group_id, right.group_id)))
+        if key not in score_cache:
+            score_cache[key] = candidate_name_similarity(left, right)
+        return score_cache[key]
+
+    def pair_is_eligible(left: ProposalGroup, right: ProposalGroup) -> bool:
+        pair = frozenset((left.group_id, right.group_id))
+        return pair not in excluded and score(left, right) >= min_similarity
+
+    remaining = set(ids)
+    batches: list[list[ProposalGroup]] = []
+
+    for seed in ordered:
+        if seed.group_id not in remaining:
+            continue
+
+        # Use an inverted token index so the cheap blocker scales with plausible
+        # lexical neighbors rather than performing an O(n^2) comparison over the
+        # entire candidate pool. Purely character-similar spellings with no shared
+        # informative token are intentionally left for later evidence/promotion.
+        potential_neighbor_ids: set[str] = set()
+        for token in tokens_by_id[seed.group_id]:
+            potential_neighbor_ids.update(token_index.get(token, set()))
+        potential_neighbor_ids &= remaining
+        potential_neighbor_ids.discard(seed.group_id)
+
+        neighbors = []
+        for candidate_id in potential_neighbor_ids:
+            candidate = by_id[candidate_id]
+            if pair_is_eligible(seed, candidate):
+                neighbors.append((score(seed, candidate), candidate_id))
+        neighbors.sort(key=lambda item: (-item[0], item[1]))
+
+        batch = [seed]
+        for _, candidate_id in neighbors:
+            if len(batch) >= max_group_size:
+                break
+            candidate = by_id[candidate_id]
+            if all(pair_is_eligible(candidate, member) for member in batch):
+                batch.append(candidate)
+
+        for group in batch:
+            remaining.remove(group.group_id)
+
+        if len(batch) >= 2:
+            batches.append(batch)
+
+    return batches
+
+
+def reviewed_candidate_non_equivalence_pairs(
+    state: TaxonomyState,
+) -> set[frozenset[str]]:
+    """Return still-relevant candidate pairs previously judged non-equivalent."""
+
+    current_ids = {group.group_id for group in state.candidate_proposals}
+    excluded: set[frozenset[str]] = set()
+    for entry in state.history:
+        if entry.kind != "candidate_consolidation":
+            continue
+        assignments = entry.consolidation.assignments
+        reviewed_ids = sorted(set(assignments) & current_ids)
+        for index, left_id in enumerate(reviewed_ids):
+            for right_id in reviewed_ids[index + 1 :]:
+                if assignments[left_id] != assignments[right_id]:
+                    excluded.add(frozenset((left_id, right_id)))
+    return excluded
+
+
+def validate_candidate_consolidation_semantics(
+    candidate_groups: Sequence[ProposalGroup],
+    result: CandidateConsolidationOutput,
+) -> None:
+    expected_ids = {group.group_id for group in candidate_groups}
+    returned_ids = set(result.assignments)
+    if returned_ids != expected_ids:
+        raise ValueError(
+            "Candidate consolidation coverage mismatch; "
+            f"missing={sorted(expected_ids - returned_ids)}, "
+            f"unknown={sorted(returned_ids - expected_ids)}"
+        )
+
+    unknown_representatives = set(result.assignments.values()) - expected_ids
+    if unknown_representatives:
+        raise ValueError(
+            "Candidate consolidation referenced unknown representatives "
+            f"{sorted(unknown_representatives)}"
+        )
+
+    for representative_id in set(result.assignments.values()):
+        if result.assignments[representative_id] != representative_id:
+            raise ValueError(
+                "Candidate consolidation representatives must map to themselves; "
+                f"{representative_id!r} maps to "
+                f"{result.assignments[representative_id]!r}"
+            )
+
+
+def apply_candidate_consolidation(
+    state: TaxonomyState,
+    candidate_groups: Sequence[ProposalGroup],
+    result: CandidateConsolidationOutput,
+    *,
+    max_total_labels: int,
+) -> TaxonomyState:
+    validate_candidate_consolidation_semantics(candidate_groups, result)
+
+    selected_by_id = {group.group_id: group for group in candidate_groups}
+    if len(selected_by_id) != len(candidate_groups):
+        raise ValueError("candidate_groups contains duplicate group IDs")
+
+    state_by_id = {group.group_id: group for group in state.candidate_proposals}
+    if len(state_by_id) != len(state.candidate_proposals):
+        raise ValueError("Taxonomy state contains duplicate candidate proposal groups")
+
+    for group_id, group in selected_by_id.items():
+        persisted = state_by_id.get(group_id)
+        if persisted is None:
+            raise ValueError(
+                f"Consolidation candidate {group_id!r} is absent from taxonomy state"
+            )
+        if persisted != group:
+            raise ValueError(
+                f"Consolidation candidate {group_id!r} does not match persisted evidence"
+            )
+
+    clusters: dict[str, list[ProposalGroup]] = {}
+    for source_id, representative_id in result.assignments.items():
+        clusters.setdefault(representative_id, []).append(selected_by_id[source_id])
+
+    resulting_groups: list[ProposalGroup] = []
+    for representative_id in sorted(clusters):
+        representative = selected_by_id[representative_id]
+        combined_support = sum(
+            group.support_count for group in clusters[representative_id]
+        )
+        resulting_groups.append(
+            representative.model_copy(update={"support_count": combined_support})
+        )
+
+    selected_ids = set(selected_by_id)
+    remaining = [
+        group
+        for group in state.candidate_proposals
+        if group.group_id not in selected_ids
+    ]
+    consolidated_candidates = sorted(
+        [*remaining, *resulting_groups], key=lambda group: group.group_id
+    )
+
+    before_support = sum(group.support_count for group in candidate_groups)
+    after_support = sum(group.support_count for group in resulting_groups)
+    if before_support != after_support:
+        raise RuntimeError(
+            "Candidate consolidation changed total support unexpectedly: "
+            f"before={before_support}, after={after_support}"
+        )
+
+    now = int(time.time())
+    history_entry = CandidateConsolidationHistoryEntry(
+        timestamp_unix=now,
+        discovery_seq_end=state.last_screened_discovery_seq,
+        taxonomy_version=state.schema_version,
+        candidate_groups=list(candidate_groups),
+        consolidation=result,
+        resulting_groups=resulting_groups,
+    )
+    candidate = state.model_copy(
+        update={
+            "candidate_proposals": consolidated_candidates,
+            "history": [*state.history, history_entry],
+            "updated_at_unix": now,
+        }
+    )
+    validate_taxonomy_state(candidate, max_total_labels=max_total_labels)
+    return candidate
+
+
+def consolidate_candidate_pool(
+    *,
+    model: ModelClient,
+    state: TaxonomyState,
+    aspect: str,
+    taxonomy_path: Path,
+    max_total_labels: int,
+    min_promotion_support: int,
+    maintenance_max_tokens: int,
+    persist: bool = True,
+) -> TaxonomyState:
+    batches = build_candidate_consolidation_batches(
+        state.candidate_proposals,
+        max_group_size=state.discovery_settings.candidate_consolidation_max_groups,
+        min_similarity=(
+            state.discovery_settings.candidate_consolidation_min_name_similarity
+        ),
+        excluded_pairs=reviewed_candidate_non_equivalence_pairs(state),
+    )
+    # If even the whole lexical neighborhood lacks enough evidence to cross the
+    # promotion threshold, semantic consolidation cannot affect this maintenance
+    # pass. Defer the LLM comparison until more support arrives.
+    batches = [
+        batch
+        for batch in batches
+        if sum(group.support_count for group in batch) >= min_promotion_support
+    ]
+    if not batches:
+        return state
+
+    LOGGER.info(
+        "Maintenance: Semantically consolidating %d candidate groups in %d lexical neighborhoods",
+        sum(len(batch) for batch in batches),
+        len(batches),
+    )
+
+    try:
+        results = model.consolidate_candidate_batches(
+            state,
+            batches,
+            aspect,
+            max_tokens=min(
+                maintenance_max_tokens,
+                state.discovery_settings.candidate_consolidation_max_tokens,
+            ),
+        )
+    except StructuredModelOutputError as exc:
+        # Consolidation is an optional evidence-aggregation optimization. A malformed
+        # consolidation response must never terminate a long discovery run; leaving
+        # candidates separate preserves all evidence and is semantically conservative.
+        LOGGER.warning(
+            "Candidate consolidation output was malformed; leaving all candidate "
+            "groups separate for this maintenance pass: %s",
+            exc,
+        )
+        return state
+
+    if len(results) != len(batches):
+        raise RuntimeError(
+            f"Expected {len(batches)} candidate-consolidation results, got "
+            f"{len(results)}"
+        )
+
+    changed = False
+    for batch_index, (batch, result) in enumerate(
+        zip(batches, results, strict=True), start=1
+    ):
+        try:
+            updated = apply_candidate_consolidation(
+                state,
+                batch,
+                result,
+                max_total_labels=max_total_labels,
+            )
+        except ValueError as exc:
+            LOGGER.warning(
+                "Candidate consolidation batch %d was semantically invalid; "
+                "leaving that neighborhood unchanged: %s",
+                batch_index,
+                exc,
+            )
+            continue
+
+        if updated is not state:
+            changed = True
+            state = updated
+
+    if changed and persist:
+        atomic_write_model(taxonomy_path, state)
+    return state
 
 
 def validate_proposal_screening_semantics(
@@ -668,6 +1058,15 @@ def run_periodic_maintenance(
         max_screening_groups=max_screening_groups,
         maintenance_max_tokens=maintenance_max_tokens,
     )
+    state = consolidate_candidate_pool(
+        model=model,
+        state=state,
+        aspect=aspect,
+        taxonomy_path=taxonomy_path,
+        max_total_labels=max_total_labels,
+        min_promotion_support=min_promotion_support,
+        maintenance_max_tokens=maintenance_max_tokens,
+    )
     state = promote_eligible_candidates(
         model=model,
         state=state,
@@ -881,6 +1280,17 @@ def run_final_maintenance(
     receive a second final pass on resume.
     """
 
+    state = consolidate_candidate_pool(
+        model=model,
+        state=state,
+        aspect=aspect,
+        taxonomy_path=taxonomy_path,
+        max_total_labels=max_total_labels,
+        min_promotion_support=min_promotion_support,
+        maintenance_max_tokens=maintenance_max_tokens,
+        persist=False,
+    )
+
     while True:
         merge_result = model.final_merge_pass(
             state,
@@ -933,9 +1343,12 @@ def run_final_maintenance(
 
 def build_discovery_settings(
     args: argparse.Namespace,
-    input_path: Path,
+    input_path: Path | None,
 ) -> DiscoverySettings:
-    resolved, size, mtime_ns = file_fingerprint(input_path)
+    if input_path is not None:
+        resolved, size, mtime_ns = file_fingerprint(input_path)
+    else:
+        resolved, size, mtime_ns = input_source_name(args), 0, 0
     return DiscoverySettings(
         input_path=resolved,
         input_size_bytes=size,
@@ -1034,7 +1447,6 @@ def reset_discovery_files(taxonomy_path: Path, discovery_output: Path) -> None:
 
 
 def run_discovery(args: argparse.Namespace) -> None:
-    input_path = Path(args.input)
     seed_path = Path(args.seed_labels)
     taxonomy_path = Path(args.taxonomy)
     discovery_output = Path(args.discovery_output)
@@ -1049,7 +1461,10 @@ def run_discovery(args: argparse.Namespace) -> None:
         )
 
     seed_labels = load_seed_labels(seed_path, args.expected_seed_label_count)
-    settings = build_discovery_settings(args, input_path)
+    settings = build_discovery_settings(
+        args,
+        Path(args.jsonl_input) if args.jsonl_input else None,
+    )
     state = initialize_or_load_taxonomy(
         taxonomy_path=taxonomy_path,
         seed_labels=seed_labels,
@@ -1095,18 +1510,35 @@ def run_discovery(args: argparse.Namespace) -> None:
     seen_input_ids: set[str] = set()
     next_seq = last_seq + 1
     processed_this_run = 0
-    total_input = count_jsonl_records(input_path)
-    if len(completed_ids) > total_input:
+
+    # Total input documents is only known if a JSONL input file is provided.
+    # This is because streaming from HF is slow in comparison.
+    total_input = (
+        count_jsonl_records(Path(args.jsonl_input)) if args.jsonl_input else None
+    )
+    if total_input is not None and len(completed_ids) > total_input:
         raise ValueError(
             f"Discovery output contains {len(completed_ids)} records but input "
-            f"contains only {total_input} documents"
+            f"contains only {total_input} documents. Cannot resume discovery."
         )
-    total_pending = total_input - len(completed_ids)
+    total_pending = (
+        total_input - len(completed_ids) if total_input is not None else None
+    )
+    remaining_documents = None
+    if args.max_documents is not None:
+        remaining_documents = max(args.max_documents - len(completed_ids), 0)
+        if total_pending is not None:
+            total_pending = min(total_pending, remaining_documents)
+        else:
+            # If dataset size is unknown, we assume max_documents is the upper bound for progress logging.
+            total_pending = remaining_documents
 
     stop_event = None
-    if getattr(args, "compute_logging", False) and total_pending > 0:
+    if getattr(args, "compute_logging", False) and (
+        total_pending is None or total_pending > 0
+    ):
 
-        def _get_progress() -> tuple[int, int]:
+        def _get_progress() -> tuple[int, int | None]:
             return processed_this_run, total_pending
 
         stop_event = start_compute_logger(
@@ -1118,12 +1550,19 @@ def run_discovery(args: argparse.Namespace) -> None:
     try:
 
         def pending_docs() -> Iterator[InputDocument]:
-            for doc in stream_documents(input_path):
+            yielded = 0
+            documents = iter(stream_input_documents(args))
+            while remaining_documents is None or yielded < remaining_documents:
+                try:
+                    doc = next(documents)
+                except StopIteration:
+                    break
                 if doc.doc_id in seen_input_ids:
                     raise ValueError(f"Duplicate doc_id {doc.doc_id!r} in input corpus")
                 seen_input_ids.add(doc.doc_id)
                 if doc.doc_id in completed_ids:
                     continue
+                yielded += 1
                 yield doc
 
         for batch in batch_iter(pending_docs(), args.batch_size):
@@ -1210,7 +1649,7 @@ def run_discovery(args: argparse.Namespace) -> None:
         raise ValueError("Input corpus contains no documents")
 
     missing_completed = completed_ids - seen_input_ids
-    if missing_completed:
+    if args.max_documents is None and missing_completed:
         raise ValueError(
             "Discovery output contains document IDs absent from the input corpus: "
             f"{sorted(missing_completed)[:10]}"

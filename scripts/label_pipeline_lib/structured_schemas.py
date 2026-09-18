@@ -6,6 +6,7 @@ from typing import Any, ClassVar, Generic, TypeVar
 from pydantic import BaseModel, model_validator  # type: ignore
 
 from label_pipeline_lib.schemas import (
+    CandidateConsolidationOutput,
     CandidatePromotionOutput,
     FinalMergeOutput,
     FinalRevisionOutput,
@@ -145,6 +146,49 @@ def _keyed_proposal_screening_model(
     )
 
 
+class _KeyedCandidateConsolidationOutput(CandidateConsolidationOutput):
+    """Boundary model for exact keyed candidate consolidation assignments."""
+
+    expected_candidate_group_ids: ClassVar[tuple[str, ...]] = ()
+
+    @model_validator(mode="after")
+    def exact_candidate_coverage(self) -> "_KeyedCandidateConsolidationOutput":
+        expected = set(self.expected_candidate_group_ids)
+        if not expected:
+            raise RuntimeError(
+                "_KeyedCandidateConsolidationOutput was used without expected candidate IDs"
+            )
+
+        returned = set(self.assignments)
+        if returned != expected:
+            raise ValueError(
+                "Candidate consolidation key coverage mismatch; "
+                f"missing={sorted(expected - returned)}, "
+                f"unknown={sorted(returned - expected)}"
+            )
+
+        unknown_targets = sorted(set(self.assignments.values()) - expected)
+        if unknown_targets:
+            raise ValueError(
+                "Candidate consolidation referenced unknown representative IDs "
+                f"{unknown_targets}"
+            )
+        return self
+
+
+def _keyed_candidate_consolidation_model(
+    expected_candidate_group_ids: list[str],
+) -> type[_KeyedCandidateConsolidationOutput]:
+    return type(
+        "KeyedCandidateConsolidationOutput",
+        (_KeyedCandidateConsolidationOutput,),
+        {
+            "expected_candidate_group_ids": tuple(expected_candidate_group_ids),
+            "__module__": __name__,
+        },
+    )
+
+
 def build_discovery_output_schema(
     valid_label_ids: list[str],
     max_assigned_labels: int,
@@ -278,6 +322,49 @@ def build_proposal_screening_output_schema(
         valid_proposal_group_ids, valid_target_label_ids
     )
 
+    return StructuredSchemaSpec(
+        model_type=boundary_model,
+        json_schema=schema,
+    )
+
+
+def build_candidate_consolidation_output_schema(
+    valid_candidate_group_ids: list[str],
+) -> StructuredSchemaSpec[CandidateConsolidationOutput]:
+    """Require one representative assignment for every candidate key.
+
+    The object-keyed representation avoids array uniqueness requirements that are
+    unsupported by the vLLM 0.19.1 XGrammar backend. Each value must name one of
+    the supplied candidates; Python later verifies that representatives map to
+    themselves so the assignments form a proper partition.
+    """
+
+    _require_unique_nonempty(
+        valid_candidate_group_ids, field_name="valid_candidate_group_ids"
+    )
+
+    representative_schema = {
+        "type": "string",
+        "enum": list(valid_candidate_group_ids),
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "assignments": {
+                "type": "object",
+                "properties": {
+                    candidate_group_id: representative_schema
+                    for candidate_group_id in valid_candidate_group_ids
+                },
+                "required": list(valid_candidate_group_ids),
+                "additionalProperties": False,
+            }
+        },
+        "required": ["assignments"],
+        "additionalProperties": False,
+    }
+
+    boundary_model = _keyed_candidate_consolidation_model(valid_candidate_group_ids)
     return StructuredSchemaSpec(
         model_type=boundary_model,
         json_schema=schema,

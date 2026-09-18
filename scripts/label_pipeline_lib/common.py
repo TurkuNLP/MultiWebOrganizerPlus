@@ -96,11 +96,83 @@ def stream_documents(path: Path) -> Iterator[InputDocument]:
             if not line.strip():
                 raise ValueError(f"Empty JSONL line in {path}:{line_no}")
             try:
-                yield InputDocument.model_validate_json(line)
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError("input record must be a JSON object")
+                yield InputDocument.model_validate(normalize_input_record(row))
             except ValidationError as exc:
                 raise ValueError(
                     f"Invalid input record in {path}:{line_no}: {exc}"
                 ) from exc
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"Invalid input record in {path}:{line_no}: {exc}"
+                ) from exc
+
+
+def normalize_input_record(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    if "doc_id" not in normalized:
+        for alias in ("id", "warc_record_id"):
+            if alias in normalized:
+                normalized["doc_id"] = normalized[alias]
+                break
+    return normalized
+
+
+def stream_dataset_documents(
+    dataset_name: str,
+    *,
+    dataset_config: str | None = None,
+    dataset_split: str = "train",
+) -> Iterator[InputDocument]:
+    try:
+        from datasets import load_dataset  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "The 'datasets' package is required when using --dataset-input"
+        ) from exc
+
+    LOGGER.info(
+        "Streaming Hugging Face dataset %s%s [%s]",
+        dataset_name,
+        f"/{dataset_config}" if dataset_config else "",
+        dataset_split,
+    )
+    rows = load_dataset(
+        dataset_name,
+        name=dataset_config,
+        split=dataset_split,
+        streaming=True,
+    )
+    for row_number, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            raise ValueError(f"Hugging Face dataset row {row_number} must be a mapping")
+        try:
+            yield InputDocument.model_validate(normalize_input_record(row))
+        except ValidationError as exc:
+            raise ValueError(
+                f"Invalid Hugging Face dataset row {row_number}: {exc}"
+            ) from exc
+
+
+def stream_input_documents(args: Any) -> Iterator[InputDocument]:
+    if args.jsonl_input:
+        yield from stream_documents(Path(args.jsonl_input))
+        return
+    yield from stream_dataset_documents(
+        args.dataset_input,
+        dataset_config=getattr(args, "dataset_config", None),
+        dataset_split=getattr(args, "dataset_split", "train"),
+    )
+
+
+def input_source_name(args: Any) -> str:
+    if args.jsonl_input:
+        return str(Path(args.jsonl_input).resolve())
+    config = getattr(args, "dataset_config", None)
+    split = getattr(args, "dataset_split", "train")
+    return f"hf://{args.dataset_input}/{config or 'default'}?split={split}"
 
 
 def count_jsonl_records(path: Path) -> int:

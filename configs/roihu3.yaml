@@ -2,7 +2,7 @@
 
 mode: "discover"  # choice: discover, classify
 aspect: "topics"
-run_name: "creative1"  # name of the run, used to create output directories and files
+run_name: "consolidation_test"  # name of the run, used to create output directories and files
 
 model:
   name: "Qwen/Qwen3.8-27B"
@@ -11,18 +11,20 @@ model:
   max_document_tokens: 8192
   classification_max_tokens: 4096
   maintenance_max_tokens: 8192
-  tensor_parallel_size: 4
+  tensor_parallel_size: 2
   gpu_memory_utilization: 0.90
   dtype: "auto"
   seed: 0
   thinking_mode: "disabled"  # disabled, enabled, template-default
 
 paths:
-  jsonl_input: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/data/FineWebSample.jsonl"
-  seed_labels: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/configs/seed_labels/topics.yaml"
-  taxonomy: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/results/${run_name}/taxonomy_state.json"
-  discovery_output: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/results/${run_name}/discovery.jsonl"
-  output: "/scratch/project_462001516/users/tarkkaot/MultiWebOrganizerPlus/results/${run_name}/final_labels.jsonl"
+  dataset_input: "HuggingFaceFW/fineweb"
+  dataset_config: "sample-10BT"
+  dataset_split: "train"
+  seed_labels: "/scratch/project_2020507/users/tarkkaot/MultiWebOrganizerPlus/configs/seed_labels/topics.yaml"
+  taxonomy: "/scratch/project_2020507/users/tarkkaot/MultiWebOrganizerPlus/results/${run_name}/taxonomy_state.json"
+  discovery_output: "/scratch/project_2020507/users/tarkkaot/MultiWebOrganizerPlus/results/${run_name}/discovery.jsonl"
+  output: "/scratch/project_2020507/users/tarkkaot/MultiWebOrganizerPlus/results/${run_name}/final_labels.jsonl"
 
 discovery:
   max_proposals_per_doc: 3
@@ -40,7 +42,7 @@ maintenance:
   max_revision_labels: 16
 
   # Support threshold before promotion.
-  min_promotion_support: 2
+  min_promotion_support: 10
 
   max_total_labels: 100
   expected_seed_label_count: 24
